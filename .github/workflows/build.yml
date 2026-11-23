@@ -40,6 +40,19 @@ jobs:
       - name: Build with PyInstaller
         shell: bash
         run: |
+          # The GUI only uses QtCore / QtGui / QtWidgets: exclude every other Qt module (and unused stdlib bloat).
+          EXCLUDES=""
+          for m in Qt3DAnimation Qt3DCore Qt3DExtras Qt3DInput Qt3DLogic Qt3DRender QtBluetooth QtCharts \
+                   QtConcurrent QtDataVisualization QtDesigner QtHelp QtMultimedia QtMultimediaWidgets \
+                   QtNetwork QtNetworkAuth QtNfc QtOpenGL QtOpenGLWidgets QtPdf QtPdfWidgets QtPositioning \
+                   QtQml QtQuick QtQuick3D QtQuickControls2 QtQuickWidgets QtRemoteObjects QtScxml QtSensors \
+                   QtSerialPort QtSql QtStateMachine QtTest QtTextToSpeech QtUiTools QtWebChannel \
+                   QtWebEngineCore QtWebEngineQuick QtWebEngineWidgets QtWebSockets QtWebView QtXml; do
+            EXCLUDES="$EXCLUDES --exclude-module PySide6.$m"
+          done
+          for m in tkinter unittest pydoc test lib2to3 sqlite3 matplotlib scipy pandas IPython; do
+            EXCLUDES="$EXCLUDES --exclude-module $m"
+          done
           pyinstaller --noconfirm --clean --windowed \
             --name pckswf-gui \
             --paths . --paths gui \
@@ -49,7 +62,18 @@ jobs:
             --hidden-import swfr --hidden-import swfw --hidden-import tess --hidden-import swfbitmap \
             --hidden-import pckfont --hidden-import sheetfont --hidden-import fonttex \
             --hidden-import fontTools.ttLib --hidden-import PIL --hidden-import numpy \
+            $EXCLUDES \
             gui/pckswf_gui.py
+
+      - name: Trim unused Qt files
+        shell: bash
+        run: |
+          # software OpenGL fallback, PDF/Network/QML/Quick libs, translations and unused plugins are not needed by a QtWidgets app
+          find dist/pckswf-gui \( -iname 'opengl32sw.dll' -o -iname 'd3dcompiler_47.dll' \
+               -o -iname '*Qt6Pdf*' -o -iname '*Qt6Network*' -o -iname '*Qt6Qml*' -o -iname '*Qt6Quick*' \
+               -o -iname '*Qt6VirtualKeyboard*' -o -iname '*Qt6OpenGL*' -o -iname '*Qt6Svg*' \) -type f -print -delete || true
+          find dist/pckswf-gui -type d \( -name translations -o -name qml -o -name tls -o -name networkinformation \) -print -exec rm -rf {} + || true
+          du -sh dist/pckswf-gui
 
       - name: Package
         shell: bash
