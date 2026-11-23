@@ -50,7 +50,7 @@ jobs:
                    QtWebEngineCore QtWebEngineQuick QtWebEngineWidgets QtWebSockets QtWebView QtXml; do
             EXCLUDES="$EXCLUDES --exclude-module PySide6.$m"
           done
-          for m in tkinter unittest pydoc test lib2to3 sqlite3 matplotlib scipy pandas IPython; do
+          for m in numpy PIL.ImageTk PIL.ImageQt tkinter unittest pydoc test lib2to3 sqlite3 matplotlib scipy pandas IPython; do
             EXCLUDES="$EXCLUDES --exclude-module $m"
           done
           pyinstaller --noconfirm --clean --windowed \
@@ -61,7 +61,7 @@ jobs:
             --hidden-import rpck --hidden-import pck2swf --hidden-import swf2pck --hidden-import swfimport \
             --hidden-import swfr --hidden-import swfw --hidden-import tess --hidden-import swfbitmap \
             --hidden-import pckfont --hidden-import sheetfont --hidden-import fonttex \
-            --hidden-import fontTools.ttLib --hidden-import PIL --hidden-import numpy \
+            --hidden-import fontTools.ttLib --hidden-import PIL \
             $EXCLUDES \
             gui/pckswf_gui.py
 
