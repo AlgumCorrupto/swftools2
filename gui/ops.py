@@ -125,13 +125,52 @@ def build_command(tool, target):
     return [tool, target]
 
 
+def clean_env():
+    """Environment for child processes. A PyInstaller bundle points LD_LIBRARY_PATH / QT_* at its own bundled libraries,
+    which makes external programs (flash projector, java/JPEXS) load the wrong libs or crash -> restore the original."""
+    env = os.environ.copy()
+    if getattr(sys, 'frozen', False):
+        for var in ('LD_LIBRARY_PATH', 'LD_PRELOAD', 'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH'):
+            orig = env.get(var + '_ORIG')
+            if orig is not None:
+                env[var] = orig
+            else:
+                env.pop(var, None)
+            env.pop(var + '_ORIG', None)
+        for var in ('QT_PLUGIN_PATH', 'QT_QPA_PLATFORM_PLUGIN_PATH', 'QML2_IMPORT_PATH', 'QML_IMPORT_PATH'):
+            env.pop(var, None)
+    return env
+
+
+class Launched:
+    """A started external program; poll() reports an early crash together with the tail of its stderr."""
+    def __init__(self, cmd, proc, errfile):
+        self.cmd, self.proc, self.errfile = cmd, proc, errfile
+
+    def check(self):
+        """None while still running (or exited cleanly); else an error text."""
+        rc = self.proc.poll()
+        if rc in (None, 0):
+            return None
+        try:
+            with open(self.errfile, 'rb') as f:
+                tail = f.read()[-2000:].decode('utf-8', 'replace').strip()
+        except OSError:
+            tail = ''
+        return 'exited with code %s%s' % (rc, (':\n' + tail) if tail else ' (no error output)')
+
+
 def launch(tool, target):
-    """Start `tool target` detached; raises OSError if it cannot be started."""
+    """Start `tool target` detached; raises OSError if it cannot be started. Returns a Launched."""
     cmd = build_command(tool, target)
-    kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    fd, errfile = tempfile.mkstemp(prefix='pckswf_launch_', suffix='.log')
+    kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=fd, close_fds=True, env=clean_env())
     if os.name == 'nt':
         kw['creationflags'] = 0x00000008 | 0x00000200      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
         kw['start_new_session'] = True
-    subprocess.Popen(cmd, **kw)
-    return cmd
+    try:
+        proc = subprocess.Popen(cmd, **kw)
+    finally:
+        os.close(fd)
+    return Launched(cmd, proc, errfile)

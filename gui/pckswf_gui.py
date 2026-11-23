@@ -33,12 +33,10 @@ CREDITS_HTML = """
 pck2swf, swf2pck and swfimport.</p>
 <h4>Credits</h4>
 <ul>
-<li>AlgumCorrupto, the swf pck library and GUI</li>
 <li><b>pck-swf-tools v3</b> &ndash; the conversion library this GUI drives (tessellator, preview baking, bitmap/font handling).</li>
 <li><b>RAGE-SWF-research</b> (AlgumCorrupto) &ndash; <a href="https://github.com/AlgumCorrupto/RAGE-SWF-research">github.com/AlgumCorrupto/RAGE-SWF-research</a></li>
 <li><b>mc3pc</b> (weatheredclown) &ndash; <a href="https://github.com/weatheredclown/mc3pc">github.com/weatheredclown/mc3pc</a></li>
 <li><b>JPEXS Free Flash Decompiler</b> &ndash; <a href="https://github.com/jindrapetrik/jpexs-decompiler">github.com/jindrapetrik/jpexs-decompiler</a></li>
-<li>Thiekus and offbruno, the OG researchers.</li>
 <li><b>Qt for Python (PySide6)</b> and <b>qt-themes</b> (Monokai theme)</li>
 <li><b>Pillow</b>, <b>NumPy</b> and <b>fontTools</b> &ndash; used by the library</li>
 </ul>
@@ -855,10 +853,21 @@ class MainWindow(QMainWindow):
 
     def _launch(self, tool, target, what):
         try:
-            cmd = ops.launch(tool, target)
-            self.log('gui', 'Started %s: %s' % (what, ' '.join('"%s"' % c if ' ' in c else c for c in cmd)))
+            lp = ops.launch(tool, target)
         except OSError as e:
-            self.error('Could not start %s:\n%s' % (what, e))
+            return self.error('Could not start %s:\n%s\n\nCommand: %s' % (what, e, ' '.join(ops.build_command(tool, target))))
+        self.log('gui', 'Started %s: %s' % (what, ' '.join('"%s"' % c if ' ' in c else c for c in lp.cmd)))
+
+        def check():                                      # a program that dies right away is reported in the console
+            err = lp.check()
+            if err:
+                self.log('error', '%s %s' % (what, err))
+            try:
+                if lp.proc.poll() is not None:
+                    os.remove(lp.errfile)
+            except OSError:
+                pass
+        QTimer.singleShot(2500, check)
 
     def open_with_flash(self, swf):
         if not os.path.isfile(swf):
