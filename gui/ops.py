@@ -133,6 +133,35 @@ def anim_replace(pck, out, sprite, src, fit='cover', length='timing', opacity=No
     return pckanim.replace(pck, out, sprite, src, fit, length, opacity, bool(dither), fps, log=lambda m: print(m))
 
 
+def load_scan(pck):
+    """Loading-screen pck -> plain dict: text summary, colours {bar,text,tint} ((r,g,b) or None), artwork info or None."""
+    import pckload
+    s = pckload.scan(pck)
+    print(s['text'])
+    a = s['art']
+    return dict(text=s['text'], colors=s['colors'], size=s['size'],
+                art=None if not a else dict(size=a['size'], tex=a['tex'], screen=a['screen'], aspect=a['aspect'], unsupported=a['unsupported']))
+
+
+def load_preview(pck, out_png, image=None, fit='cover', keep_mask=True, dither=False, palette='shared'):
+    """Write a PNG preview of the artwork (current, or as it would look with `image`); returns the path."""
+    import pckload
+    pckload.preview(pck, image or None, fit, keep_mask, dither, palette).save(out_png)
+    return out_png
+
+
+def load_export_art(pck, out):
+    """Write the stitched 512x256 artwork as PNG."""
+    import pckload
+    return pckload.export_art(pck, out)
+
+
+def load_edit(pck, out, bar=None, text=None, tint=None, image=None, fit='cover', keep_mask=True, dither=False, palette='shared'):
+    """Apply colour changes ((r,g,b) or None = keep) and/or a new artwork image to a loading-screen pck and write `out`."""
+    import pckload
+    return pckload.edit(pck, out, bar, text, tint, None, image or None, fit, keep_mask, dither, palette, log=lambda m: print(m))
+
+
 def preview_swf(pck, tmpdir):
     """Export `pck` to a preview .swf inside tmpdir and return its path."""
     os.makedirs(tmpdir, exist_ok=True)

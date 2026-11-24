@@ -17,9 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ops                                      # noqa: E402  (also puts the tools folder on sys.path)
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot, QSettings, QTimer   # noqa: E402
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QMovie, QPalette               # noqa: E402
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QMovie, QPalette, QPixmap               # noqa: E402
 from PySide6.QtWidgets import (                                                         # noqa: E402
-    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget)
 
@@ -27,6 +27,7 @@ APP_NAME = 'PCK <-> SWF Tools'
 APP_VERSION = '1.0.0'
 PORT_TAB_NAME = 'Port SWF \u2192 New PCK'        # the "swf import" tab; rename here if you prefer another name
 ANIM_TAB_NAME = 'Animated BG (GIF)'              # the "replace a looping background movie with a GIF" tab
+LOAD_TAB_NAME = 'Loading Screen'                 # the "loading screen accent colour + artwork" tab
 
 CREDITS_HTML = """
 <h3>%(name)s <small>v%(ver)s</small></h3>
@@ -34,7 +35,7 @@ CREDITS_HTML = """
 pck2swf, swf2pck and swfimport.</p>
 <h4>Credits</h4>
 <ul>
-<li><b>pck-swf-tools v3</b> (AlgumCorrupto/rato.jpg</li>
+<li><b>pck-swf-tools v3</b> (AlgumCorrupto/rato.jpg)</li>
 <li><b>RAGE-SWF-research</b> (AlgumCorrupto/rato.jpg, Thiekus, offbruno) &ndash; <a href="https://github.com/AlgumCorrupto/RAGE-SWF-research">github.com/AlgumCorrupto/RAGE-SWF-research</a></li>
 <li><b>mc3pc</b> (weatheredclown) &ndash; <a href="https://github.com/weatheredclown/mc3pc">github.com/weatheredclown/mc3pc</a></li>
 <li><b>JPEXS Free Flash Decompiler</b> &ndash; <a href="https://github.com/jindrapetrik/jpexs-decompiler">github.com/jindrapetrik/jpexs-decompiler</a></li>
@@ -848,6 +849,258 @@ class AnimTab(BaseTab):
         self.win.job_finished_message(ok, 'Replace animation')
 
 
+class ColorButton(QPushButton):
+    """A button that shows a colour (as its background and #rrggbb text) and opens a colour dialog when clicked."""
+    changed = Signal()
+
+    def __init__(self, label):
+        super().__init__()
+        self.label = label
+        self.rgb = None
+        self.clicked.connect(self._pick)
+        self.set_rgb(None)
+
+    def set_rgb(self, rgb, quiet=True):
+        self.rgb = tuple(rgb) if rgb else None
+        if self.rgb:
+            lum = 0.299 * self.rgb[0] + 0.587 * self.rgb[1] + 0.114 * self.rgb[2]
+            self.setText('#%02x%02x%02x' % self.rgb)
+            self.setStyleSheet('background-color: rgb(%d,%d,%d); color: %s; padding: 5px 14px;' % (self.rgb + ('#000' if lum > 140 else '#fff',)))
+        else:
+            self.setText('not found')
+            self.setStyleSheet('')
+        self.setEnabled(self.rgb is not None)
+        if not quiet:
+            self.changed.emit()
+
+    def _pick(self):
+        if not self.rgb:
+            return
+        c = QColorDialog.getColor(QColor(*self.rgb), self, self.label)
+        if c.isValid():
+            self.set_rgb((c.red(), c.green(), c.blue()), quiet=False)
+
+
+class LoadTab(BaseTab):
+    """Edit the accent colours and the artwork (two 256x256 textures stitched into 512x256) of a loading-screen pck."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.info = None
+        self.orig = {}                       # colours as read from the pck
+        self._prev_token = 0
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel('<i>Loading screens (loading_*.pck, loadscreen_*.pck) have an accent colour and an artwork that is two textures stitched '
+                             'side by side. Change either or both; only what you change is written.</i>'))
+
+        g = QGroupBox('1. Loading screen PCK')
+        f = QFormLayout(g)
+        self.pck = PathRow('open', ['.pck'], 'PCK files (*.pck);;All files (*)', 'Drop a loading screen .pck here', self.start_dir)
+        f.addRow('PCK file', self.pck)
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        f.addRow(self.summary)
+        lay.addWidget(g)
+
+        g = QGroupBox('2. Accent colour')
+        f = QFormLayout(g)
+        self.c_bar = ColorButton('Loader bar colour')
+        self.c_text = ColorButton('Big text colour')
+        self.c_tint = ColorButton('Strip tint colour')
+        self.c_bar.setToolTip('Fill of the loader bar')
+        self.c_text.setToolTip('The big translucent text behind the screen (the originals use a brighter shade than the bar, except the green one)')
+        self.c_tint.setToolTip('What the white strip pattern at the bottom becomes (stored as a colour transform: multiplier + add)')
+        row = QHBoxLayout()
+        row.addWidget(self.c_bar)
+        row.addWidget(self.c_text)
+        row.addWidget(self.c_tint)
+        row.addStretch()
+        f.addRow('Bar / Text / Strip tint', row)
+        row = QHBoxLayout()
+        self.btn_all = QPushButton('Set all from one colour\u2026')
+        self.btn_all.setToolTip('Bar and text get the colour, the strip tint gets it at half saturation and half brightness (how loading_generic_a is built)')
+        self.btn_reset = QPushButton('Reset colours')
+        row.addWidget(self.btn_all)
+        row.addWidget(self.btn_reset)
+        row.addStretch()
+        f.addRow(row)
+        lay.addWidget(g)
+
+        g = QGroupBox('3. Artwork')
+        f = QFormLayout(g)
+        self.preview = QLabel('(open a loading screen pck)')
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumHeight(270)
+        f.addRow(self.preview)
+        self.img = PathRow('open', None, 'Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff);;All files (*)',
+                           'Optional: drop the new artwork image here', self.start_dir)
+        self.fit = QComboBox()
+        self.fit.addItem('Crop to fill (no distortion)', 'cover')
+        self.fit.addItem('Stretch to fill', 'stretch')
+        self.fit.addItem('Fit inside (black bars)', 'contain')
+        self.fit.setToolTip('The artwork is shown at about the aspect ratio of the preview. "Crop" cuts your image to it.')
+        self.pal = QComboBox()
+        self.pal.addItem('Shared palette (no seam between the halves)', 'shared')
+        self.pal.addItem('Separate palettes (more colours, may show a seam)', 'separate')
+        self.mask = QCheckBox('Keep the original rounded corners')
+        self.mask.setChecked(True)
+        self.dither = QCheckBox('Dither colours (smoother gradients, adds grain)')
+        f.addRow('New artwork', self.img)
+        f.addRow('Fit', self.fit)
+        f.addRow('Palette', self.pal)
+        f.addRow(self.mask)
+        f.addRow(self.dither)
+        row = QHBoxLayout()
+        self.btn_exp = QPushButton('Export current artwork as PNG\u2026')
+        row.addWidget(self.btn_exp)
+        row.addStretch()
+        f.addRow(row)
+        lay.addWidget(g)
+
+        g = QGroupBox('4. Output')
+        f = QFormLayout(g)
+        self.dst = PathRow('save', None, 'PCK files (*.pck)', 'Output .pck', self.start_dir)
+        f.addRow('Output PCK', self.dst)
+        lay.addWidget(g)
+
+        row = QHBoxLayout()
+        self.run = QPushButton('Save loading screen PCK')
+        self.btn_flash = QPushButton('Preview result in Flash Player')
+        self.run.clicked.connect(self.save)
+        self.btn_flash.clicked.connect(lambda: win.preview_pck(self.dst.text()))
+        row.addWidget(self.run)
+        row.addWidget(self.btn_flash)
+        row.addStretch()
+        lay.addLayout(row)
+        lay.addStretch()
+
+        self.pck.changed.connect(self._pck_changed)
+        for w in (self.img.changed, self.fit.currentIndexChanged, self.pal.currentIndexChanged, self.mask.toggled, self.dither.toggled):
+            w.connect(self._update_preview)
+        self.btn_all.clicked.connect(self.set_all)
+        self.btn_reset.clicked.connect(self.reset_colors)
+        self.btn_exp.clicked.connect(self.export_art)
+        self.dst.changed.connect(self._refresh)
+        self._refresh()
+
+    def _refresh(self, *_):
+        ok = self.info is not None
+        self.run.setEnabled(ok)
+        self.btn_all.setEnabled(ok and any(self.orig.get(k) for k in ('bar', 'text', 'tint')))
+        self.btn_reset.setEnabled(ok)
+        self.btn_exp.setEnabled(ok and bool(self.info.get('art')))
+        self.img.setEnabled(ok and bool(self.info.get('art')) and not self.info['art']['unsupported'])
+        self.btn_flash.setEnabled(os.path.isfile(self.dst.text()))
+
+    # ---- loading --------------------------------------------------------------------------------------------------
+    def _pck_changed(self, t):
+        self.info = None
+        self.orig = {}
+        for b in (self.c_bar, self.c_text, self.c_tint):
+            b.set_rgb(None)
+        self.summary.setText('')
+        self._refresh()
+        if not t or not os.path.isfile(t):
+            return
+        self.dst.suggest(os.path.splitext(t)[0] + '_edited.pck')
+        self.win.log('gui', 'Scanning %s' % t)
+        self.win.run_job(lambda: ops.load_scan(t), lambda ok, res: self._scanned(t, ok, res), [self.pck])
+
+    def _scanned(self, path, ok, res):
+        if path != self.pck.text():
+            return
+        if not ok:
+            return self.win.job_finished_message(False, 'Scan')
+        self.info = res
+        self.orig = dict(res['colors'])
+        self.summary.setText(res['text'].replace('\n', '<br>'))
+        self.reset_colors()
+        if not res['art'] and not any(self.orig.values()):
+            self.info = None
+            self.win.error('This does not look like a loading screen pck: no artwork and no accent colours were found.')
+        self._refresh()
+        self._update_preview()
+
+    def reset_colors(self):
+        self.c_bar.set_rgb(self.orig.get('bar'))
+        self.c_text.set_rgb(self.orig.get('text'))
+        self.c_tint.set_rgb(self.orig.get('tint'))
+
+    def set_all(self):
+        start = self.orig.get('text') or self.orig.get('bar') or (128, 128, 128)
+        c = QColorDialog.getColor(QColor(*start), self, 'Accent colour')
+        if not c.isValid():
+            return
+        import colorsys
+        r, g, b = c.red(), c.green(), c.blue()
+        h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        tint = tuple(int(round(x * 255)) for x in colorsys.hsv_to_rgb(h, s * 0.5, v * 0.5))
+        if self.orig.get('bar'):
+            self.c_bar.set_rgb((r, g, b))
+        if self.orig.get('text'):
+            self.c_text.set_rgb((r, g, b))
+        if self.orig.get('tint'):
+            self.c_tint.set_rgb(tint)
+
+    # ---- artwork preview ------------------------------------------------------------------------------------------
+    def _update_preview(self, *_):
+        t = self.pck.text()
+        if not self.info or not self.info.get('art'):
+            return
+        if self.win.preview_dir is None:
+            self.win.preview_dir = ops.new_preview_dir()
+        self._prev_token += 1
+        token = self._prev_token
+        out = os.path.join(self.win.preview_dir, 'loadart_%d.png' % token)
+        img = self.img.text() if os.path.isfile(self.img.text()) else None
+        kw = dict(image=img, fit=self.fit.currentData(), keep_mask=self.mask.isChecked(), dither=self.dither.isChecked(),
+                  palette=self.pal.currentData())
+
+        def done(ok, res):
+            if token != self._prev_token:
+                return
+            if ok:
+                self.preview.setPixmap(QPixmap(res))
+            else:
+                self.preview.setText('(preview failed - see the log)')
+        self.win.run_job(lambda: ops.load_preview(t, out, **kw), done)
+
+    def export_art(self):
+        t = self.pck.text()
+        start = os.path.splitext(t)[0] + '_art.png'
+        out, _ = QFileDialog.getSaveFileName(self, 'Export artwork', start, 'PNG (*.png)')
+        if not out:
+            return
+        self.win.log('gui', 'Export artwork: %s' % out)
+        self.win.run_job(lambda: ops.load_export_art(t, out), lambda ok, _r: self.win.job_finished_message(ok, 'Export'), [self.btn_exp])
+
+    # ---- saving ---------------------------------------------------------------------------------------------------
+    def save(self):
+        src, dst = self.pck.text(), self.dst.text()
+        if not self.info:
+            return self.win.error('Please open a loading screen pck first.')
+        if not dst:
+            return self.win.error('Please choose an output .pck path.')
+        if os.path.abspath(dst) == os.path.abspath(src):
+            return self.win.error('The output must be a different file than the source pck (so the original stays untouched).')
+        img = self.img.text()
+        if img and not os.path.isfile(img):
+            return self.win.error('The artwork image does not exist.')
+        changed = {}
+        for key, btn in (('bar', self.c_bar), ('text', self.c_text), ('tint', self.c_tint)):
+            changed[key] = btn.rgb if btn.rgb and btn.rgb != self.orig.get(key) else None
+        if not img and not any(changed.values()):
+            return self.win.error('Nothing to change: pick different colours and/or an artwork image.')
+        kw = dict(image=img or None, fit=self.fit.currentData(), keep_mask=self.mask.isChecked(), dither=self.dither.isChecked(),
+                  palette=self.pal.currentData(), **changed)
+        self.win.log('gui', 'Save loading screen: %s' % dst)
+        self.win.run_job(lambda: ops.load_edit(src, dst, **kw), self._done, [self.run])
+
+    def _done(self, ok, _res):
+        self._refresh()
+        self.win.job_finished_message(ok, 'Save loading screen')
+
+
 class BrowserTab(BaseTab):
     def __init__(self, win):
         super().__init__(win)
@@ -992,10 +1245,11 @@ class WelcomeDialog(QDialog):
             '<li><b>SWF \u2192 PCK</b>: turn an edited SWF (one that came from a pck) back into a .pck.</li>'
             '<li><b>%s</b>: build a brand-new .pck from a plain SWF, using an original pck as donor.</li>'
             '<li><b>%s</b>: replace the looping background movie of a menu pck (bg_arcade, bg_career, bg_options, \u2026) with your own GIF.</li>'
+            '<li><b>%s</b>: change the accent colour and the artwork of a loading screen pck.</li>'
             '<li><b>PCK Browser</b>: right-click a file to copy its path or preview it.</li>'
             '</ol>'
             '<p>Everything the library does is logged in the console at the bottom of the window.</p>'
-            % (html.escape(APP_NAME), html.escape(PORT_TAB_NAME), html.escape(ANIM_TAB_NAME)))
+            % (html.escape(APP_NAME), html.escape(PORT_TAB_NAME), html.escape(ANIM_TAB_NAME), html.escape(LOAD_TAB_NAME)))
         lbl.setWordWrap(True)
         lbl.setTextFormat(Qt.RichText)
         b_set, b_close, b_never = QPushButton('Open Settings'), QPushButton('Close'), QPushButton('Never show again')
@@ -1056,11 +1310,13 @@ class MainWindow(QMainWindow):
         self.tab_s2p = SwfToPckTab(self)
         self.tab_port = SwfPortTab(self)
         self.tab_anim = AnimTab(self)
+        self.tab_load = LoadTab(self)
         self.tab_browser = BrowserTab(self)
         self.tabs.addTab(self.tab_p2s.scrolled(), 'PCK \u2192 SWF')
         self.tabs.addTab(self.tab_s2p.scrolled(), 'SWF \u2192 PCK')
         self.tabs.addTab(self.tab_port.scrolled(), PORT_TAB_NAME)
         self.tabs.addTab(self.tab_anim.scrolled(), ANIM_TAB_NAME)
+        self.tabs.addTab(self.tab_load.scrolled(), LOAD_TAB_NAME)
         self.tabs.addTab(self.tab_browser, 'PCK Browser')
 
         split = QSplitter(Qt.Vertical)

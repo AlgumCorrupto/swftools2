@@ -302,6 +302,19 @@ def target_count(mode, old_n, frames, durs, fps):
 # ----------------------------------------------------------------------------------------------------------------------
 # writing
 # ----------------------------------------------------------------------------------------------------------------------
+def quantize_opaque(rgb, ncol=256, dither=False):
+    """RGB image -> (index bytes, list of ncol (r, g, b)).  Median cut; with dither the pixels are then re-mapped onto that palette with
+    Floyd-Steinberg (Pillow ignores `dither` unless a palette is supplied, so this takes two passes)."""
+    from PIL import Image
+    q = rgb.quantize(colors=ncol, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    pal = q.getpalette()[:3 * ncol]; pal += [0] * (3 * ncol - len(pal)); idx = q.tobytes()
+    if dither:
+        padded = pal + pal[3 * (ncol - 1):3 * ncol] * (256 - ncol)        # unused slots repeat the last colour, never a new one
+        pimg = Image.new('P', (1, 1)); pimg.putpalette(padded)
+        idx = bytes(min(i, ncol - 1) for i in rgb.quantize(palette=pimg, dither=Image.Dither.FLOYDSTEINBERG).tobytes())
+    return idx, [(pal[3 * i], pal[3 * i + 1], pal[3 * i + 2]) for i in range(ncol)]
+
+
 def quantize_frame(im, dither=False):
     """RGBA texture image -> (indices, 256 palette entries (r, g, b, ps2 alpha 0..128))"""
     from PIL import Image
@@ -315,10 +328,8 @@ def quantize_frame(im, dither=False):
             v = acc.get(i); al = round(sum(v) / len(v)) if v else 0
             cols.append((pal[3 * i], pal[3 * i + 1], pal[3 * i + 2], min(128, round(al / 2))))
         return idx, cols
-    q = im.convert('RGB').quantize(colors=256, method=Image.Quantize.MEDIANCUT,
-                                   dither=Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE)
-    pal = q.getpalette()[:768]; pal += [0] * (768 - len(pal))
-    return q.tobytes(), [(pal[3 * i], pal[3 * i + 1], pal[3 * i + 2], 128) for i in range(256)]
+    idx, cols = quantize_opaque(im.convert('RGB'), 256, dither)
+    return idx, [(r, g, b, 128) for r, g, b in cols]
 
 
 def _texture_tail(p):

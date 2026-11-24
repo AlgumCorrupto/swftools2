@@ -7,7 +7,8 @@ Keep the `gui/` folder inside the pck-swf-tools-v3 folder (it imports pck2swf / 
 
 * Settings (menu bar): Flash Player path, JPEXS path (exe, .sh or .jar), PCK folder. Stored with QSettings.
 * Help -> Welcome window / About.
-* Tabs: PCK -> SWF (always preview mode), SWF -> PCK, "Port SWF -> New PCK" (swfimport; rename via PORT_TAB_NAME), "Animated BG (GIF)" (pckanim; rename via ANIM_TAB_NAME), PCK Browser.
+* Tabs: PCK -> SWF (always preview mode), SWF -> PCK, "Port SWF -> New PCK" (swfimport; rename via PORT_TAB_NAME), "Animated BG (GIF)" (pckanim; rename via ANIM_TAB_NAME), "Loading Screen" (pckload; rename via LOAD_TAB_NAME), PCK Browser.
+* Loading Screen: open a loading_*.pck / loadscreen_*.pck; three colour buttons (loader bar, big text, strip tint) or "Set all from one colour", a live preview of the artwork, a replacement image with fit (crop / stretch / letterbox), palette (shared = no seam, default / separate), optional dither, optional original rounded corners. Only what you change is written; the output must be a different file.
 * Animated BG (GIF): pick a menu pck (bg_arcade / bg_career / bg_options ...), the animations found are listed (Play / Export as GIF to see the current one), choose your GIF (APNG, animated WebP or a folder of images also work), fit (crop / stretch / letterbox), length (GIF speed, original frame count, one per frame, custom), optional opacity, then "Replace animation & save PCK". The output must be a different file than the input. The estimate under the options warns when the pck would grow.
 * Library work runs in QThreads; library stdout/stderr and tracebacks go to the console, GUI problems are pop-ups.
 * Previews from the PCK Browser are written to a temp folder (removed when the app closes).
