@@ -33,8 +33,8 @@ CREDITS_HTML = """
 pck2swf, swf2pck and swfimport.</p>
 <h4>Credits</h4>
 <ul>
-<li><b>pck-swf-tools v3</b> &ndash; the conversion library this GUI drives (tessellator, preview baking, bitmap/font handling).</li>
-<li><b>RAGE-SWF-research</b> (AlgumCorrupto) &ndash; <a href="https://github.com/AlgumCorrupto/RAGE-SWF-research">github.com/AlgumCorrupto/RAGE-SWF-research</a></li>
+<li><b>pck-swf-tools v3</b> (AlgumCorrupto/rato.jpg</li>
+<li><b>RAGE-SWF-research</b> (AlgumCorrupto/rato.jpg, Thiekus, offbruno) &ndash; <a href="https://github.com/AlgumCorrupto/RAGE-SWF-research">github.com/AlgumCorrupto/RAGE-SWF-research</a></li>
 <li><b>mc3pc</b> (weatheredclown) &ndash; <a href="https://github.com/weatheredclown/mc3pc">github.com/weatheredclown/mc3pc</a></li>
 <li><b>JPEXS Free Flash Decompiler</b> &ndash; <a href="https://github.com/jindrapetrik/jpexs-decompiler">github.com/jindrapetrik/jpexs-decompiler</a></li>
 <li><b>Qt for Python (PySide6)</b> and <b>qt-themes</b> (Monokai theme)</li>
