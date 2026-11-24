@@ -216,3 +216,17 @@ Not tested in the game.
   Checked: 274 shapes keep their coverage (worst IoU 0.997); round trips pck -> swf -> pck stay byte-identical (faithful and preview).
 - pckfont2ttf.py: exports a font object as a TrueType font (outlines traced from the largest bitmap sheet, 1024 units/em = engine units; advances from the
   font's table, else the sheet records, else (spaces) the static text records; ascent/descent from the font object).
+
+## Animated menu backgrounds: pckanim.py (bg_arcade / bg_career / bg_options)
+`python3 pckanim.py bg_arcade.pck list | export out.gif [--frames] | replace my.gif out.pck [--fit cover|contain|stretch] [--length original|timing|frames|N] [--opacity PCT] [--dither]`
+The background is a looping "movie" stored as a SPRITE (bg_*: object 449, 224 frames, 15 fps from the root frame rate) whose every frame is one Place on depth 1
+(frame 0 also carries the matrix, later frames inherit it) of a SHAPE with a single quad (1280x1280 twips = 64x64 px) whose bitmap fill (flag 0x41) is a 64x64 8bpp
+swizzled bitmap with its own 256-colour palette; shapes/bitmaps alternate in the object list (frame k = objects 2k+1 bitmap, 2k+2 shape). The movie's placement scales it ~9.7 x 6.8 (about 620x438 px, aspect 1.40-1.44) and draws it with
+a colour transform alpha of 22/64 (34 %) in bg_arcade/career/options (the Q2.6 multiply byte is cxform+3). Sprite header: +8 u16 and +0x10 u32 = frame count, +0xC frame table (u32 aux, u32 first command per frame).
+bg_options has a second clip (sprite 450, 220 frames, first Place matrix 256x246) that shows the same shapes as the first 220 frames of sprite 449 and is placed on the 4 page variants; sprite 449 itself is used by the 5th.
+Replacement is append-only: frames k < old count patch bitmap pixels + palette in place (rpck.bitmap_encode_into), extra frames append a bitmap (swfbitmap.emit_bitmap, its texture chained to the file's last texture),
+a cloned shape (0xA0 bytes: header, display list, 2 fill entries, empty stroke table; only the fill's bitmap pointer changes) and a cloned 0x18-byte Place command, then a new frame table and a new object list
+(root +0x10 pointer, +0x2A count; new bitmap/shape pairs are appended as objects). Fewer frames only lower the counts (old data stays in the file). Linked clips keep their length difference (new = N - (old_main - old_linked)).
+Opacity writes a fresh 8-byte colour transform for every placement of the clip(s). Texture size stays 64x64: each extra frame costs ~5.7 KB and the pck is loaded into a fixed heap, so there is no larger-texture option (replacing 224 frames by
+128x128 ones would also leave the old 64x64 data unused in the file, since nothing can be removed from the middle without relocating every pointer).
+Verified (selftest_anim.py, three sample pcks): pckaudit clean, frames read back match the source, same/shorter/longer/timing modes, pck2swf -> swf2pck reproduces the written pck byte-identically. NOT verified in the game.

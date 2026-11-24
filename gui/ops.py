@@ -97,6 +97,42 @@ def swf_port(swf, pck, donor, fit=None, drop_actions=(), sizes=(), no_preloader=
     return pck
 
 
+def anim_scan(pck):
+    """Frame animations (menu background movies) in a pck -> list of plain dicts (see pckanim.find_animations)."""
+    import pckanim
+    from rpck import Pck
+    p = Pck(pck)
+    res = []
+    for a in pckanim.find_animations(p):
+        print(pckanim.describe(a))
+        res.append(dict(sprite=a['sprite'], nframes=a['nframes'], tex=a['tex'], fps=a['fps'], screen=a['screen'],
+                        aspect=a['aspect'], alpha=a['alpha'], linked=[(l['sprite'], l['nframes']) for l in a['linked']],
+                        unsupported=a['unsupported'], text=pckanim.describe(a), size=len(p.d) + 0x80,
+                        per_frame=pckanim.estimate_growth(a, a['nframes'] + 1)))
+    if not res:
+        print('no frame animation found in %s' % pck)
+    return res
+
+
+def anim_source_info(src, fps=15.0):
+    """(frames, duration ms) of the replacement GIF / image folder."""
+    import pckanim
+    return pckanim.source_info(src, fps)
+
+
+def anim_export_gif(pck, sprite, out):
+    """Write the animation `sprite` of `pck` as a GIF (scaled to its on-screen aspect)."""
+    import pckanim
+    return pckanim.export_gif(pck, sprite, out)
+
+
+def anim_replace(pck, out, sprite, src, fit='cover', length='timing', opacity=None, dither=False, fps=None):
+    """Replace animation `sprite` of `pck` with the GIF/APNG/WebP or image folder `src` and write `out`.
+    length: 'original' | 'timing' | 'frames' | int;  opacity: None (keep) or 0..1."""
+    import pckanim
+    return pckanim.replace(pck, out, sprite, src, fit, length, opacity, bool(dither), fps, log=lambda m: print(m))
+
+
 def preview_swf(pck, tmpdir):
     """Export `pck` to a preview .swf inside tmpdir and return its path."""
     os.makedirs(tmpdir, exist_ok=True)

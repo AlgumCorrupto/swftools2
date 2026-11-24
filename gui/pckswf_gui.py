@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ops                                      # noqa: E402  (also puts the tools folder on sys.path)
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot, QSettings, QTimer   # noqa: E402
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QPalette               # noqa: E402
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QMovie, QPalette               # noqa: E402
 from PySide6.QtWidgets import (                                                         # noqa: E402
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (                                                 
 APP_NAME = 'PCK <-> SWF Tools'
 APP_VERSION = '1.0.0'
 PORT_TAB_NAME = 'Port SWF \u2192 New PCK'        # the "swf import" tab; rename here if you prefer another name
+ANIM_TAB_NAME = 'Animated BG (GIF)'              # the "replace a looping background movie with a GIF" tab
 
 CREDITS_HTML = """
 <h3>%(name)s <small>v%(ver)s</small></h3>
@@ -557,6 +558,296 @@ class SwfPortTab(BaseTab):
         self.win.run_job(lambda: ops.swf_port(src, dst, donor, **kw), lambda ok, r: self.win.job_finished_message(ok, 'Port SWF'), [self.run])
 
 
+class AnimPreviewDialog(QDialog):
+    """Plays an exported GIF (QMovie) in a small window."""
+
+    def __init__(self, parent, gif, title):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.movie = QMovie(gif)
+        self.label = QLabel()
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setMovie(self.movie)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.label)
+        self.movie.jumpToFrame(0)
+        sz = self.movie.currentPixmap().size()
+        if sz.isValid() and sz.width() > 0:
+            self.label.setMinimumSize(sz)
+        self.movie.start()
+
+    def done(self, r):
+        self.movie.stop()
+        super().done(r)
+
+
+class AnimTab(BaseTab):
+    """Replace the looping background movie of a menu pck (bg_arcade, bg_career, bg_options, ...) with an animated GIF."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.anims = []
+        self.src_info = None                 # (frame count, duration ms) of the chosen replacement
+        self._info_token = 0
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel('<i>These pcks store a looping movie as a sprite that shows one small bitmap per frame. '
+                             'This tab swaps those frames for the frames of your own GIF (APNG, animated WebP or a folder of images work too).</i>'))
+
+        g = QGroupBox('1. PCK with the animation')
+        f = QFormLayout(g)
+        self.pck = PathRow('open', ['.pck'], 'PCK files (*.pck);;All files (*)', 'Drop a .pck here (e.g. bg_arcade.pck)', self.start_dir)
+        f.addRow('PCK file', self.pck)
+        self.list = QListWidget()
+        self.list.setMaximumHeight(96)
+        f.addRow('Animations found', self.list)
+        row = QHBoxLayout()
+        self.btn_prev = QPushButton('Play selected')
+        self.btn_exp = QPushButton('Export selected as GIF\u2026')
+        self.btn_prev.setToolTip('Decode the current frames to a GIF and play it here')
+        self.btn_exp.setToolTip('Save the current animation as a GIF (handy as a starting point for your own)')
+        row.addWidget(self.btn_prev)
+        row.addWidget(self.btn_exp)
+        row.addStretch()
+        f.addRow(row)
+        lay.addWidget(g)
+
+        g = QGroupBox('2. Your replacement')
+        f = QFormLayout(g)
+        self.gif = PathRow('open', None, 'Animations (*.gif *.png *.apng *.webp);;All files (*)',
+                           'Drop a .gif (or APNG / animated WebP) here', self.start_dir)
+        self.folder = PathRow('dir', None, placeholder='Optional: a folder of images instead (played in name order)')
+        self.fps = QDoubleSpinBox()
+        self.fps.setRange(1, 120)
+        self.fps.setDecimals(2)
+        self.fps.setValue(15)
+        self.fps.setToolTip('Frame rate of the images in the folder (a GIF carries its own timing)')
+        self.fit = QComboBox()
+        self.fit.addItem('Crop to fill (no distortion)', 'cover')
+        self.fit.addItem('Stretch to fill', 'stretch')
+        self.fit.addItem('Fit inside (black bars)', 'contain')
+        self.fit.setToolTip('The game stretches the small texture over the screen area. "Crop" cuts your GIF to that '
+                            'area\'s aspect ratio, "Stretch" squeezes the whole GIF in, "Fit inside" letterboxes it.')
+        self.length = QComboBox()
+        self.length.addItem('Play at the GIF\'s own speed', 'timing')
+        self.length.addItem('Keep the original frame count (stretches the GIF over it)', 'original')
+        self.length.addItem('One frame per GIF frame', 'frames')
+        self.length.addItem('Custom frame count\u2026', 'custom')
+        self.custom = QSpinBox()
+        self.custom.setRange(1, 65535)
+        self.custom.setValue(100)
+        self.custom.setEnabled(False)
+        lrow = QHBoxLayout()
+        lrow.addWidget(self.length, 1)
+        lrow.addWidget(self.custom)
+        self.opac_chk = QCheckBox('Override opacity')
+        self.opac = QSpinBox()
+        self.opac.setRange(0, 100)
+        self.opac.setSuffix(' %')
+        self.opac.setValue(100)
+        self.opac.setEnabled(False)
+        self.opac_chk.setToolTip('The original movies are drawn semi-transparent (about 34 %). Leave this off to keep that look, '
+                                 'or tick it to draw your GIF at the chosen opacity.')
+        orow = QHBoxLayout()
+        orow.addWidget(self.opac_chk)
+        orow.addWidget(self.opac)
+        orow.addStretch()
+        self.dither = QCheckBox('Dither colours (256 colours per frame; dithering can shimmer in motion)')
+        f.addRow('Animated image', self.gif)
+        f.addRow('...or image folder', self.folder)
+        f.addRow('Folder frame rate', self.fps)
+        f.addRow('Fit', self.fit)
+        f.addRow('Length', lrow)
+        f.addRow('Opacity', orow)
+        f.addRow(self.dither)
+        self.estimate = QLabel()
+        self.estimate.setWordWrap(True)
+        self.estimate.setTextFormat(Qt.RichText)
+        f.addRow(self.estimate)
+        lay.addWidget(g)
+
+        g = QGroupBox('3. Output')
+        f = QFormLayout(g)
+        self.dst = PathRow('save', None, 'PCK files (*.pck)', 'Output .pck', self.start_dir)
+        f.addRow('Output PCK', self.dst)
+        lay.addWidget(g)
+
+        row = QHBoxLayout()
+        self.run = QPushButton('Replace animation && save PCK')
+        self.btn_flash = QPushButton('Preview result in Flash Player')
+        self.run.clicked.connect(self.replace)
+        self.btn_flash.clicked.connect(lambda: win.preview_pck(self.dst.text()))
+        row.addWidget(self.run)
+        row.addWidget(self.btn_flash)
+        row.addStretch()
+        lay.addLayout(row)
+        lay.addStretch()
+
+        self.pck.changed.connect(self._pck_changed)
+        self.list.currentRowChanged.connect(self._selection_changed)
+        self.gif.changed.connect(self._source_changed)
+        self.folder.changed.connect(self._source_changed)
+        self.fps.valueChanged.connect(self._source_changed)
+        self.length.currentIndexChanged.connect(self._length_changed)
+        self.custom.valueChanged.connect(self._update_estimate)
+        self.opac_chk.toggled.connect(self.opac.setEnabled)
+        self.btn_prev.clicked.connect(self.play_selected)
+        self.btn_exp.clicked.connect(self.export_selected)
+        self.dst.changed.connect(self._refresh_buttons)
+        self._refresh_buttons()
+
+    # ---- state --------------------------------------------------------------------------------------------------
+    def _current(self):
+        r = self.list.currentRow()
+        return self.anims[r] if 0 <= r < len(self.anims) else None
+
+    def _refresh_buttons(self, *_):
+        a = self._current()
+        ok = a is not None
+        self.btn_prev.setEnabled(ok)
+        self.btn_exp.setEnabled(ok)
+        self.run.setEnabled(ok and not a['unsupported'])
+        self.btn_flash.setEnabled(os.path.isfile(self.dst.text()))
+
+    # ---- scanning -----------------------------------------------------------------------------------------------
+    def _pck_changed(self, t):
+        self.anims = []
+        self.list.clear()
+        self._refresh_buttons()
+        if not t or not os.path.isfile(t):
+            return
+        self.dst.suggest(os.path.splitext(t)[0] + '_gif.pck')
+        self.win.log('gui', 'Scanning %s' % t)
+        self.win.run_job(lambda: ops.anim_scan(t), lambda ok, res: self._scanned(t, ok, res), [self.pck])
+
+    def _scanned(self, path, ok, res):
+        if path != self.pck.text():           # the user picked another file meanwhile
+            return
+        if not ok:
+            return self.win.job_finished_message(False, 'Scan')
+        self.anims = res or []
+        self.list.clear()
+        for a in self.anims:
+            it = QListWidgetItem(a['text'])
+            it.setToolTip(a['text'])
+            self.list.addItem(it)
+        if not self.anims:
+            return self.win.error('No frame-by-frame animation was found in this pck.\n'
+                                  '(Looking for a sprite with at least 8 frames that each show one bitmap, as in bg_*.pck.)')
+        self.list.setCurrentRow(0)
+
+    def _selection_changed(self, *_):
+        a = self._current()
+        if a:
+            self.opac.setValue(max(0, min(100, round(a['alpha'] * 100))))
+        self._refresh_buttons()
+        self._update_estimate()
+
+    # ---- replacement source -------------------------------------------------------------------------------------
+    def _source(self):
+        return self.gif.text() or self.folder.text()
+
+    def _source_changed(self, *_):
+        src = self._source()
+        self.src_info = None
+        self._info_token += 1
+        token, fps = self._info_token, self.fps.value()
+        self._update_estimate()
+        if not src or not (os.path.isfile(src) or os.path.isdir(src)):
+            return
+
+        def done(ok, res):
+            if token == self._info_token and ok:
+                self.src_info = res
+                self._update_estimate()
+        self.win.run_job(lambda: ops.anim_source_info(src, fps), done)
+
+    def _length_changed(self, *_):
+        self.custom.setEnabled(self.length.currentData() == 'custom')
+        self._update_estimate()
+
+    def _target_frames(self, a):
+        mode = self.length.currentData()
+        if mode == 'custom':
+            return self.custom.value()
+        if mode == 'original':
+            return a['nframes']
+        if not self.src_info:
+            return None
+        n, ms = self.src_info
+        return max(1, min(65535, int(round(ms / 1000.0 * a['fps'])) if mode == 'timing' else n))
+
+    def _update_estimate(self, *_):
+        a = self._current()
+        if not a:
+            self.estimate.setText('')
+            return
+        n = self._target_frames(a)
+        if n is None:
+            self.estimate.setText('<i>Choose a GIF to see the resulting frame count.</i>')
+            return
+        txt = '%d frame(s) at %.4g fps = %.1f s loop (the original has %d).' % (n, a['fps'], n / a['fps'], a['nframes'])
+        grow = max(0, n - a['nframes']) * a['per_frame']
+        if grow:
+            txt += ('<br><span style="color:%s">The pck grows by about %d KB (to %.2f MB). The game loads a pck into a fixed-size heap '
+                    '(its limit is unknown), so prefer staying near the original %.2f MB.</span>'
+                    % (MK['orange'], round(grow / 1024.0), (a['size'] + grow) / 1048576.0, a['size'] / 1048576.0))
+        elif n < a['nframes']:
+            txt += '<br>Fewer frames than the original: the old frames stay in the file unused (same size).'
+        self.estimate.setText(txt)
+
+    # ---- actions ------------------------------------------------------------------------------------------------
+    def play_selected(self):
+        a, pck = self._current(), self.pck.text()
+        if not a:
+            return
+        if self.win.preview_dir is None:
+            self.win.preview_dir = ops.new_preview_dir()
+        out = os.path.join(self.win.preview_dir, '%s_%d.gif' % (os.path.splitext(os.path.basename(pck))[0], a['sprite']))
+
+        def done(ok, res):
+            if ok:
+                AnimPreviewDialog(self.win, res, 'Sprite %d \u2013 %s' % (a['sprite'], os.path.basename(pck))).exec()
+            else:
+                self.win.job_finished_message(False, 'Export')
+        self.win.run_job(lambda: ops.anim_export_gif(pck, a['sprite'], out), done, [self.btn_prev])
+
+    def export_selected(self):
+        a, pck = self._current(), self.pck.text()
+        if not a:
+            return
+        start = os.path.splitext(pck)[0] + '_%d.gif' % a['sprite']
+        out, _ = QFileDialog.getSaveFileName(self, 'Export animation as GIF', start, 'GIF (*.gif)')
+        if not out:
+            return
+        self.win.log('gui', 'Export animation: %s' % out)
+        self.win.run_job(lambda: ops.anim_export_gif(pck, a['sprite'], out),
+                         lambda ok, _r: self.win.job_finished_message(ok, 'Export'), [self.btn_exp])
+
+    def replace(self):
+        a, src, dst, pck = self._current(), self._source(), self.dst.text(), self.pck.text()
+        if not a:
+            return self.win.error('Please select a PCK that contains an animation first.')
+        if a['unsupported']:
+            return self.win.error('This animation cannot be replaced: %s.' % a['unsupported'])
+        if not src or not (os.path.isfile(src) or os.path.isdir(src)):
+            return self.win.error('Please choose an existing GIF (or image folder).')
+        if not dst:
+            return self.win.error('Please choose an output .pck path.')
+        if os.path.abspath(dst) == os.path.abspath(pck):
+            return self.win.error('The output must be a different file than the source pck (so the original stays untouched).')
+        mode = self.length.currentData()
+        kw = dict(fit=self.fit.currentData(), length=(self.custom.value() if mode == 'custom' else mode),
+                  opacity=(self.opac.value() / 100.0 if self.opac_chk.isChecked() else None),
+                  dither=self.dither.isChecked(), fps=(self.fps.value() if os.path.isdir(src) else None))
+        sprite = a['sprite']
+        self.win.log('gui', 'Replace animation (sprite %d): %s' % (sprite, src))
+        self.win.run_job(lambda: ops.anim_replace(pck, dst, sprite, src, **kw), self._done, [self.run])
+
+    def _done(self, ok, _res):
+        self._refresh_buttons()
+        self.win.job_finished_message(ok, 'Replace animation')
+
+
 class BrowserTab(BaseTab):
     def __init__(self, win):
         super().__init__(win)
@@ -700,10 +991,11 @@ class WelcomeDialog(QDialog):
             '<li><b>PCK \u2192 SWF</b>: drop a .pck, export a preview SWF, then open it in JPEXS or the Flash Player.</li>'
             '<li><b>SWF \u2192 PCK</b>: turn an edited SWF (one that came from a pck) back into a .pck.</li>'
             '<li><b>%s</b>: build a brand-new .pck from a plain SWF, using an original pck as donor.</li>'
+            '<li><b>%s</b>: replace the looping background movie of a menu pck (bg_arcade, bg_career, bg_options, \u2026) with your own GIF.</li>'
             '<li><b>PCK Browser</b>: right-click a file to copy its path or preview it.</li>'
             '</ol>'
             '<p>Everything the library does is logged in the console at the bottom of the window.</p>'
-            % (html.escape(APP_NAME), html.escape(PORT_TAB_NAME)))
+            % (html.escape(APP_NAME), html.escape(PORT_TAB_NAME), html.escape(ANIM_TAB_NAME)))
         lbl.setWordWrap(True)
         lbl.setTextFormat(Qt.RichText)
         b_set, b_close, b_never = QPushButton('Open Settings'), QPushButton('Close'), QPushButton('Never show again')
@@ -763,10 +1055,12 @@ class MainWindow(QMainWindow):
         self.tab_p2s = PckToSwfTab(self)
         self.tab_s2p = SwfToPckTab(self)
         self.tab_port = SwfPortTab(self)
+        self.tab_anim = AnimTab(self)
         self.tab_browser = BrowserTab(self)
         self.tabs.addTab(self.tab_p2s.scrolled(), 'PCK \u2192 SWF')
         self.tabs.addTab(self.tab_s2p.scrolled(), 'SWF \u2192 PCK')
         self.tabs.addTab(self.tab_port.scrolled(), PORT_TAB_NAME)
+        self.tabs.addTab(self.tab_anim.scrolled(), ANIM_TAB_NAME)
         self.tabs.addTab(self.tab_browser, 'PCK Browser')
 
         split = QSplitter(Qt.Vertical)
