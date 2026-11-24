@@ -70,23 +70,26 @@ def shape_records(runs):
     w = Bits(); cx = cy = 0
     for run in runs:
         nf = 1 if run['fill'] else 0; nl = 1 if run['line'] else 0
-        # pure NewStyles record
-        w.ub(0, 1); w.ub(1, 1); w.ub(0, 4)
+        # NewStyles record that also resets all three style indices to 0 (they are read with the previous NumFillBits /
+        # NumLineBits, which the shape header sets to 1): players like Ruffle keep the old index across NewStyles, and an index
+        # left over from the previous run would point past the new, possibly empty, style arrays.
+        w.ub(0, 1); w.ub(1, 1); w.ub(1, 1); w.ub(1, 1); w.ub(1, 1); w.ub(0, 1)   # type, NewStyles, Line, Fill1, Fill0, no MoveTo
+        w.ub(0, 1); w.ub(0, 1); w.ub(0, 1)                                        # FillStyle0 = FillStyle1 = LineStyle = 0
         w.align()
         w.b += bytes([nf]) + (run['fill'] if nf else b'') + bytes([nl]) + (run['line'] if nl else b'')
-        w.ub(nf, 4); w.ub(nl, 4)   # NumFillBits, NumLineBits (1 bit is enough for index 0/1)
+        w.ub(1, 4); w.ub(1, 4)     # NumFillBits, NumLineBits (always 1 bit: index 0/1, so the explicit resets below fit)
         for pts, closed in run['polys']:
             if len(pts) < 2: continue
             area = sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1] for i in range(len(pts)))
             if run.get('oriented'): area = 1      # loops already wound interior-right (holes oppositely): always FillStyle1
             x0, y0 = pts[0]
             w.ub(0, 1); w.ub(0, 1)                    # type, NewStyles
-            w.ub(nl, 1); w.ub(nf, 1); w.ub(nf, 1); w.ub(1, 1)   # Line, Fill1, Fill0, MoveTo
+            # Line, Fill1, Fill0, MoveTo: always set all three style indices (0 = none). Players such as Ruffle keep the
+            # previous index across a NewStyles record, so a stale index into the new (possibly empty) style array crashes them.
+            w.ub(1, 1); w.ub(1, 1); w.ub(1, 1); w.ub(1, 1)
             nb = sbits(x0, y0); w.ub(nb, 5); w.sb(x0, nb); w.sb(y0, nb)
-            if nf:
-                f1, f0 = (1, 0) if area >= 0 else (0, 1)
-                w.ub(f0, nf); w.ub(f1, nf)
-            if nl: w.ub(1, nl)
+            f1, f0 = ((1, 0) if area >= 0 else (0, 1)) if nf else (0, 0)
+            w.ub(f0, 1); w.ub(f1, 1); w.ub(1 if nl else 0, 1)
             cx, cy = x0, y0
             seq = list(pts[1:]) + ([pts[0]] if closed else [])
             for x, y in seq:

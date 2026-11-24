@@ -186,7 +186,7 @@ class Conv:
             xs = [x for x, y in allpts]; ys = [y for x, y in allpts]
             bounds = W.rect(min(xs), max(xs), min(ys), max(ys))
         else: bounds = W.rect(0, 0, 0, 0)
-        body = struct.pack('<H', i) + bounds + b'\x00\x00\x00' + W.shape_records(runs)
+        body = struct.pack('<H', i) + bounds + b'\x00\x00\x11' + W.shape_records(runs)   # no styles yet; NumFillBits = NumLineBits = 1
         return W.tag(32, body)
 
     # ---------- bitmaps ----------
