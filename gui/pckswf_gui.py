@@ -16,19 +16,24 @@ os.environ.setdefault('QT_API', 'pyside6')      # for qt-themes / qtpy
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ops                                      # noqa: E402  (also puts the tools folder on sys.path)
 from pckload import DEFAULT_FRAME                # noqa: E402  (bundled assets/frame.svg)
+import pckbitmaps                                # noqa: E402  (bitmap viewer / exporter / replacer)
+import rpck                                      # noqa: E402  (rpck.replacing: save over the source pck, keeping it as .old)
 
-from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot, QSettings, QTimer   # noqa: E402
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QMovie, QPalette, QPixmap               # noqa: E402
+from PySide6.QtCore import Qt, QObject, QSize, QThread, Signal, Slot, QSettings, QTimer   # noqa: E402
+from PySide6.QtGui import (QAction, QColor, QFont, QGuiApplication, QIcon, QImage, QMovie, QPainter, QPalette, QPen,   # noqa: E402
+                           QPixmap)
 from PySide6.QtWidgets import (                                                         # noqa: E402
-    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget)
+    QAbstractItemView, QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QTabWidget,
+    QVBoxLayout, QWidget)
 
 APP_NAME = 'PCK <-> SWF Tools'
 APP_VERSION = '1.0.0'
 PORT_TAB_NAME = 'Port SWF \u2192 New PCK'        # the "swf import" tab; rename here if you prefer another name
 ANIM_TAB_NAME = 'Animated BG (GIF)'              # the "replace a looping background movie with a GIF" tab
 LOAD_TAB_NAME = 'Loading Screen'                 # the "loading screen accent colour + artwork" tab
+BITMAP_TAB_NAME = 'Bitmaps'                      # the "view / export / replace the bitmaps of a pck" tab
 
 CREDITS_HTML = """
 <h3>%(name)s <small>v%(ver)s</small></h3>
@@ -835,8 +840,6 @@ class AnimTab(BaseTab):
             return self.win.error('Please choose an existing GIF (or image folder).')
         if not dst:
             return self.win.error('Please choose an output .pck path.')
-        if os.path.abspath(dst) == os.path.abspath(pck):
-            return self.win.error('The output must be a different file than the source pck (so the original stays untouched).')
         mode = self.length.currentData()
         kw = dict(fit=self.fit.currentData(), length=(self.custom.value() if mode == 'custom' else mode),
                   opacity=(self.opac.value() / 100.0 if self.opac_chk.isChecked() else None),
@@ -1097,8 +1100,6 @@ class LoadTab(BaseTab):
             return self.win.error('Please open a loading screen pck first.')
         if not dst:
             return self.win.error('Please choose an output .pck path.')
-        if os.path.abspath(dst) == os.path.abspath(src):
-            return self.win.error('The output must be a different file than the source pck (so the original stays untouched).')
         img = self.img.text()
         if img and not os.path.isfile(img):
             return self.win.error('The artwork image does not exist.')
@@ -1118,6 +1119,685 @@ class LoadTab(BaseTab):
     def _done(self, ok, _res):
         self._refresh()
         self.win.job_finished_message(ok, 'Save loading screen')
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# bitmaps tab: grid browser + detail dialog
+# ----------------------------------------------------------------------------------------------------------------
+THUMB_MAX = 512                                   # thumbnails are cached at most this big (the grid/dialog scale them)
+IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.bmp', '.webp', '.gif', '.tif', '.tiff']
+IMAGE_FILTER = 'Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff);;All files (*)'
+FIT_CHOICES = (('Crop to fill (no distortion)', 'cover'), ('Fit inside (transparent bars)', 'contain'),
+               ('Stretch to fill (may distort)', 'stretch'))
+_CHECKER = []
+
+
+def pil_to_qimage(im):
+    """PIL image -> detached QImage (RGBA)."""
+    im = im.convert('RGBA')
+    return QImage(im.tobytes('raw', 'RGBA'), im.width, im.height, 4 * im.width, QImage.Format_RGBA8888).copy()
+
+
+def checker_pixmap(cell=8):
+    """Checkerboard tile, so transparent pixels of a bitmap are visible."""
+    if not _CHECKER:
+        pm = QPixmap(cell * 2, cell * 2)
+        pm.fill(QColor(72, 72, 72))
+        p = QPainter(pm)
+        p.fillRect(0, 0, cell, cell, QColor(100, 100, 100))
+        p.fillRect(cell, cell, cell, cell, QColor(100, 100, 100))
+        p.end()
+        _CHECKER.append(pm)
+    return _CHECKER[0]
+
+
+def fitted_pixmap(img, box):
+    """QImage -> QPixmap scaled to fit `box` (QSize) with its aspect ratio kept, painted over a checkerboard."""
+    w, h = img.width(), img.height()
+    k = min(max(1, box.width()) / w, max(1, box.height()) / h)
+    nw, nh = max(1, round(w * k)), max(1, round(h * k))
+    mode = Qt.FastTransformation if k > 1 else Qt.SmoothTransformation          # small bitmaps stay crisp when enlarged
+    scaled = img.scaled(QSize(nw, nh), Qt.IgnoreAspectRatio, mode)
+    pm = QPixmap(nw, nh)
+    p = QPainter(pm)
+    p.drawTiledPixmap(0, 0, nw, nh, checker_pixmap())
+    p.drawImage(0, 0, scaled)
+    p.end()
+    return pm
+
+
+def make_tile(img, s, modified=False):
+    """Grid icon: the bitmap at its true aspect ratio, centred in an s x s cell."""
+    pm = QPixmap(s, s)
+    pm.fill(Qt.transparent)
+    inner = fitted_pixmap(img, QSize(s - 6, s - 6))
+    x, y = (s - inner.width()) // 2, (s - inner.height()) // 2
+    p = QPainter(pm)
+    p.drawPixmap(x, y, inner)
+    p.setPen(QPen(QColor(MK['orange'] if modified else '#6a6a62'), 3 if modified else 1))
+    p.setBrush(Qt.NoBrush)
+    p.drawRect(x, y, inner.width() - 1, inner.height() - 1)
+    p.end()
+    return QIcon(pm)
+
+
+def placeholder_tile(s, text):
+    pm = QPixmap(s, s)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setPen(QColor(MK['comment']))
+    f = p.font()
+    f.setPointSize(max(10, s // 6))
+    p.setFont(f)
+    p.drawText(pm.rect(), Qt.AlignCenter, text)
+    p.end()
+    return QIcon(pm)
+
+
+class ThumbLoader(QThread):
+    """Decodes the bitmaps of a (cloned) BitmapSet one by one so the grid fills while the UI stays responsive."""
+    ready = Signal(int, int, object, str)           # generation, bitmap index, QImage or None, error text
+
+    def __init__(self, gen, bset, indices, parent=None):
+        super().__init__(parent)
+        self.gen, self.bset, self.indices = gen, bset, list(indices)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        for i in self.indices:
+            if self._stop:
+                return
+            try:
+                im = self.bset.image(i)
+                im.thumbnail((THUMB_MAX, THUMB_MAX))
+                self.ready.emit(self.gen, i, pil_to_qimage(im), '')
+            except Exception as e:                   # an unsupported texture must not stop the others
+                self.ready.emit(self.gen, i, None, str(e))
+
+
+class PreviewPane(QLabel):
+    """Shows a QImage scaled to the available space (aspect ratio kept, checkerboard behind it)."""
+
+    def __init__(self, text=''):
+        super().__init__(text)
+        self._img, self._text = None, text
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(220, 160)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+
+    def set_image(self, img, text=None):
+        self._img = img
+        if text is not None:
+            self._text = text
+        self._redraw()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._redraw()
+
+    def _redraw(self):
+        if self._img is None:
+            self.clear()
+            self.setText(self._text)
+        else:
+            self.setPixmap(fitted_pixmap(self._img, QSize(max(1, self.width() - 8), max(1, self.height() - 8))))
+
+
+class BitmapGrid(QListWidget):
+    """Icon grid. leftClicked is emitted for a plain left click (not with Ctrl/Shift, which select several)."""
+    leftClicked = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.setViewMode(QListWidget.IconMode)
+        self.setResizeMode(QListWidget.Adjust)
+        self.setMovement(QListWidget.Static)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setUniformItemSizes(True)
+        self.setWordWrap(True)
+        self.setSpacing(4)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._pressed = None
+
+    def mousePressEvent(self, e):
+        self._pressed = self.itemAt(e.position().toPoint()) if e.button() == Qt.LeftButton else None
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        it = self.itemAt(e.position().toPoint())
+        plain = not bool(e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier))
+        super().mouseReleaseEvent(e)
+        if e.button() == Qt.LeftButton and plain and it is not None and it is self._pressed:
+            self.leftClicked.emit(it)
+        self._pressed = None
+
+
+class BitmapDialog(QDialog):
+    """One bitmap: current picture, export as PNG, replace with a new image (with a preview of the quantised result)."""
+    changed = Signal(int)
+
+    def __init__(self, tab, index, replace_now=False):
+        super().__init__(tab.win)
+        self.tab, self.bset, self.index = tab, tab.bset, index
+        self._src_path, self._src_img = None, None
+        self.setWindowTitle('Bitmap #%d' % index)
+        self.resize(940, 700)
+        lay = QVBoxLayout(self)
+        self.info = QLabel()
+        self.info.setWordWrap(True)
+        self.info.setTextFormat(Qt.RichText)
+        lay.addWidget(self.info)
+
+        split = QSplitter(Qt.Horizontal)
+        for attr, title, text in (('cur', 'Current', ''), ('new', 'Replacement (as the game will show it: palette-reduced)',
+                                                           '(choose an image below)')):
+            box = QWidget()
+            bl = QVBoxLayout(box)
+            bl.setContentsMargins(0, 0, 0, 0)
+            bl.addWidget(QLabel('<b>%s</b>' % title))
+            pane = PreviewPane(text)
+            setattr(self, attr, pane)
+            bl.addWidget(pane, 1)
+            split.addWidget(box)
+        lay.addWidget(split, 1)
+
+        g = QGroupBox('Export')
+        h = QHBoxLayout(g)
+        self.restore = QCheckBox()
+        self.restore.setChecked(True)
+        self.btn_export = QPushButton('Export as PNG\u2026')
+        h.addWidget(self.restore, 1)
+        h.addWidget(self.btn_export)
+        lay.addWidget(g)
+
+        g = QGroupBox('Replace')
+        f = QFormLayout(g)
+        self.img = PathRow('open', IMAGE_EXTS, IMAGE_FILTER, 'Drop a PNG / JPG / \u2026 here or browse', tab.start_dir)
+        self.fit = QComboBox()
+        for label, val in FIT_CHOICES:
+            self.fit.addItem(label, val)
+        self.ref = QComboBox()
+        self.ref.addItem('As drawn in the game (when known)', 'auto')
+        self.ref.addItem('Stored source size', 'source')
+        self.ref.setToolTip('The aspect ratio the new image is fitted to. \"As drawn\" uses the proportions the bitmap actually has on '
+                            'screen (the shape that uses it, including its placement scale); \"Stored source size\" uses the size '
+                            'recorded in the bitmap itself. They only differ for some bitmaps.')
+        self.dither = QCheckBox('Dither colours (smoother gradients, adds grain)')
+        self.warn = QLabel()
+        self.warn.setWordWrap(True)
+        f.addRow('New image', self.img)
+        f.addRow('Aspect ratio', self.ref)
+        f.addRow('Fit', self.fit)
+        f.addRow(self.dither)
+        f.addRow(self.warn)
+        row = QHBoxLayout()
+        self.btn_apply = QPushButton('Apply replacement')
+        self.btn_revert = QPushButton('Revert to original')
+        row.addWidget(self.btn_apply)
+        row.addWidget(self.btn_revert)
+        row.addStretch()
+        f.addRow(row)
+        lay.addWidget(g)
+
+        row = QHBoxLayout()
+        self.hint = QLabel('<i>Replacements stay in memory until you use \u201cSave PCK as\u2026\u201d on the Bitmaps tab.</i>')
+        close = QPushButton('Close')
+        close.clicked.connect(self.accept)
+        row.addWidget(self.hint, 1)
+        row.addWidget(close)
+        lay.addLayout(row)
+
+        self.img.changed.connect(self._update_new)
+        self.fit.currentIndexChanged.connect(self._update_new)
+        self.ref.currentIndexChanged.connect(self._update_new)
+        self.dither.toggled.connect(self._update_new)
+        self.btn_export.clicked.connect(self._export)
+        self.btn_apply.clicked.connect(self._apply)
+        self.btn_revert.clicked.connect(self._revert)
+        self._refresh_current()
+        self._update_new()
+        if replace_now:
+            QTimer.singleShot(0, self.img.browse)
+
+    # ---- current state ----
+    def _refresh_current(self):
+        d = self.bset.info(self.index)
+        self.d = d
+        if not d['ok']:
+            self.info.setText('<b>#%d</b> &ndash; this bitmap cannot be shown or edited: %s' % (self.index, html.escape(d['error'])))
+            self.cur.set_image(None, 'unsupported')
+            for w in (self.btn_export, self.btn_apply, self.img, self.fit, self.ref, self.dither):
+                w.setEnabled(False)
+            self.btn_revert.setEnabled(False)
+            return
+        s = ('<b>#%d</b> &nbsp; %d \u00d7 %d px (aspect %.3f : 1) &nbsp;&middot;&nbsp; %d-bit palette, %d colours'
+             % (self.index, d['src_w'], d['src_h'], d['aspect'], d['bpp'], d['ncol']))
+        drawn = d['screen_aspect'] and abs(d['screen_aspect'] / d['aspect'] - 1) >= 0.01
+        if d['resized'] and not drawn:
+            s += ('<br>Stored as a %d \u00d7 %d texture that the game stretches back to %d \u00d7 %d, so that is the size shown here.'
+                  % (d['tex_w'], d['tex_h'], d['src_w'], d['src_h']))
+        if drawn:
+            s += ('<br>Stored as a %d \u00d7 %d texture, but the game draws it at <b>%.3f : 1</b> (%s), so it is shown at %d \u00d7 %d here '
+                  'and new images are fitted to that aspect.'
+                  % (d['tex_w'], d['tex_h'], d['screen_aspect'],
+                     'its shape scaled by the placement' if d['screen_basis'] == 'placement' else 'its shape',
+                     d['auto_size'][0], d['auto_size'][1]))
+        elif d['screen_note']:
+            s += '<br><span style=\"color:%s\">%s &ndash; using the stored source size.</span>' % (MK['orange'], html.escape(d['screen_note'][:1].upper() + d['screen_note'][1:]))
+        if d['shared_with']:
+            s += ('<br><span style="color:%s">Shares its pixel data with %s &ndash; replacing it changes those too.</span>'
+                  % (MK['orange'], ', '.join('#%d' % j for j in d['shared_with'])))
+        if d['modified']:
+            s += '<br><span style="color:%s">Replaced (not saved yet).</span>' % MK['orange']
+        self.info.setText(s)
+        shown = d['auto_size'] != (d['tex_w'], d['tex_h'])
+        self.restore.setText('Restore the true proportions (%d \u00d7 %d)' % d['auto_size']
+                             if shown else 'Export at the stored size (%d \u00d7 %d)' % (d['tex_w'], d['tex_h']))
+        self.restore.setEnabled(shown)
+        self.btn_revert.setEnabled(d['modified'])
+        try:
+            self.cur.set_image(pil_to_qimage(self.bset.image(self.index)))
+        except Exception as e:
+            self.cur.set_image(None, 'cannot decode: %s' % e)
+
+    # ---- replacement preview ----
+    def _source(self, path):
+        if path != self._src_path:
+            self._src_img, self._src_path = pckbitmaps.load_image(path), path
+        return self._src_img
+
+    def _update_new(self, *_):
+        path = self.img.text()
+        ok = False
+        self.warn.setText('')
+        if not self.d['ok']:
+            return
+        if not path or not os.path.isfile(path):
+            self.new.set_image(None, '(choose an image below)' if not path else 'file not found')
+        else:
+            try:
+                src = self._source(path)
+                ref = self.ref.currentData()
+                pv = self.bset.preview_replacement(self.index, src, self.fit.currentData(), self.dither.isChecked(), True, ref)
+                self.new.set_image(pil_to_qimage(pv))
+                ok = True
+                sa, da = src.width / src.height, self.bset.reference_aspect(self.d, ref)
+                if abs(sa / da - 1) > 0.03:
+                    how = {'cover': 'cropped to fit', 'contain': 'letterboxed with transparent bars',
+                           'stretch': 'stretched (distorted)'}[self.fit.currentData()]
+                    self.warn.setText('<span style="color:%s">Your image is %d \u00d7 %d (%.2f : 1) but this bitmap is %.2f : 1 &ndash; '
+                                      'it will be %s.</span>' % (MK['orange'], src.width, src.height, sa, da, how))
+                else:
+                    self.warn.setText('Same aspect ratio as the bitmap.')
+            except Exception as e:
+                traceback.print_exc()
+                self.new.set_image(None, 'Cannot use this image:\n%s' % e)
+        self.btn_apply.setEnabled(ok)
+
+    # ---- actions ----
+    def _export(self):
+        self.tab.export_indices([self.index], self.restore.isChecked() and self.restore.isEnabled(), self)
+
+    def _apply(self):
+        path = self.img.text()
+        try:
+            self.bset.replace(self.index, self._source(path), self.fit.currentData(), self.dither.isChecked(), self.ref.currentData())
+        except Exception as e:
+            traceback.print_exc()
+            return self.tab.win.error('Could not replace the bitmap:\n%s' % e)
+        self.tab.win.log('ok', 'Bitmap #%d replaced with %s (in memory - use "Save PCK as..." to write it)' % (self.index, path))
+        self.img.setText('')
+        self.changed.emit(self.index)
+        self._refresh_current()
+        self._update_new()
+
+    def _revert(self):
+        if self.bset.revert(self.index):
+            self.tab.win.log('gui', 'Bitmap #%d reverted to the original' % self.index)
+            self.changed.emit(self.index)
+        self._refresh_current()
+        self._update_new()
+
+
+class BitmapsTab(BaseTab):
+    """Grid browser for the bitmaps of a pck: click one to export it as PNG or replace it with a new image."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.bset = None
+        self.loaded = ''                     # path of the pck the grid shows
+        self.thumbs = {}                     # bitmap index -> QImage (at most THUMB_MAX px)
+        self.items = {}                      # bitmap index -> QListWidgetItem
+        self.loader = None
+        self.gen = 0
+        self.rev = self.saved_rev = 0        # change counter / value at the last save
+        self._fresh = set()                  # indices re-rendered on the GUI thread (a late thumbnail must not overwrite them)
+        self._reverting = False
+        self._done = 0
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel('<i>Click a bitmap to open it (export as PNG, replace with a new image); right-click for the menu, Ctrl/Shift-click '
+                             'selects several. Bitmaps are shown at their true proportions. Replacements stay in memory until you save a new pck.</i>'))
+        self.pck = PathRow('open', ['.pck'], 'PCK files (*.pck);;All files (*)', 'Drop a .pck here', self.start_dir)
+        row = QHBoxLayout()
+        row.addWidget(QLabel('PCK file'))
+        row.addWidget(self.pck, 1)
+        lay.addLayout(row)
+
+        row = QHBoxLayout()
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText('Filter (e.g. 20, 128x64, modified)\u2026')
+        self.filter.setClearButtonEnabled(True)
+        self.tile = QSlider(Qt.Horizontal)
+        self.tile.setRange(64, 320)
+        self.tile.setSingleStep(16)
+        self.tile.setPageStep(32)
+        self.tile.setFixedWidth(160)
+        try:
+            self.tile.setValue(int(self.win.settings.get('bitmap_tile', 160)))
+        except (TypeError, ValueError):
+            self.tile.setValue(160)
+        row.addWidget(self.filter, 1)
+        row.addWidget(QLabel('Size'))
+        row.addWidget(self.tile)
+        lay.addLayout(row)
+
+        self.grid = BitmapGrid()
+        lay.addWidget(self.grid, 1)
+
+        row = QHBoxLayout()
+        self.status = QLabel('(open a pck)')
+        self.btn_save = QPushButton('Save PCK as\u2026')
+        self.btn_revert_all = QPushButton('Revert all')
+        self.btn_save.setToolTip('Writes the pck with the replaced bitmaps to a new file (choosing the original\'s own name keeps the original as <name>.pck.old)')
+        row.addWidget(self.status, 1)
+        row.addWidget(self.btn_revert_all)
+        row.addWidget(self.btn_save)
+        lay.addLayout(row)
+
+        self._tile_timer = QTimer(self)
+        self._tile_timer.setSingleShot(True)
+        self._tile_timer.setInterval(80)
+        self._tile_timer.timeout.connect(self._retile)
+        self.pck.changed.connect(self._pck_changed)
+        self.filter.textChanged.connect(self._apply_filter)
+        self.tile.valueChanged.connect(lambda *_: self._tile_timer.start())
+        self.grid.leftClicked.connect(lambda it: QTimer.singleShot(0, lambda: self.open_bitmap(it.data(Qt.UserRole))))
+        self.grid.customContextMenuRequested.connect(self._menu)
+        self.btn_save.clicked.connect(self.save)
+        self.btn_revert_all.clicked.connect(self.revert_all)
+        self._retile()
+        self._refresh()
+
+    # ---- state ----
+    @property
+    def dirty(self):
+        return self.bset is not None and bool(self.bset.modified) and self.rev != self.saved_rev
+
+    def confirm_discard(self):
+        """True when there is nothing unsaved, or the user agrees to drop it."""
+        if not self.dirty:
+            return True
+        r = QMessageBox.question(self, 'Unsaved bitmap changes',
+                                 '%d replaced bitmap(s) have not been saved to a new pck. Discard them?' % len(self.bset.modified))
+        return r == QMessageBox.Yes
+
+    def _refresh(self):
+        n_mod = len(self.bset.modified) if self.bset else 0
+        self.btn_save.setEnabled(n_mod > 0)
+        self.btn_revert_all.setEnabled(n_mod > 0)
+        if not self.bset:
+            return
+        total = len(self.bset.indices)
+        s = '%s: %d bitmap(s)' % (os.path.basename(self.loaded), total)
+        if self._done < total:
+            s += ' \u2013 decoding %d / %d\u2026' % (self._done, total)
+        if n_mod:
+            s += ' \u2013 %d replaced (unsaved)' % n_mod if self.dirty else ' \u2013 %d replaced (saved)' % n_mod
+        self.status.setText(s)
+
+    def selected_indices(self):
+        return sorted(it.data(Qt.UserRole) for it in self.grid.selectedItems())
+
+    # ---- loading ----
+    def _stop_loader(self):
+        if self.loader:
+            self.loader.stop()
+            self.loader.wait(3000)
+            self.loader = None
+
+    def _pck_changed(self, t):
+        if self._reverting:
+            return
+        if t != self.loaded and not self.confirm_discard():
+            self._reverting = True
+            self.pck.setText(self.loaded)
+            self._reverting = False
+            return
+        self._stop_loader()
+        self.gen += 1
+        self.bset, self.loaded = None, ''
+        self.thumbs.clear()
+        self.items.clear()
+        self._fresh.clear()
+        self.grid.clear()
+        self.rev = self.saved_rev = 0
+        self._done = 0
+        self.status.setText('(open a pck)')
+        self._refresh()
+        if not t or not os.path.isfile(t):
+            return
+        self.win.log('gui', 'Reading bitmaps from %s' % t)
+        try:
+            bs = pckbitmaps.BitmapSet(t)
+        except Exception as e:
+            traceback.print_exc()
+            return self.win.error('Could not read this pck:\n%s' % e)
+        self.bset, self.loaded = bs, t
+        if not bs.indices:
+            self.status.setText('%s has no bitmaps.' % os.path.basename(t))
+            return
+        s = self.tile.value()
+        for d in bs.listing():
+            it = QListWidgetItem(placeholder_tile(s, '\u2026'), '')
+            it.setData(Qt.UserRole, d['index'])
+            self.items[d['index']] = it
+            self._label(d['index'])
+            self.grid.addItem(it)
+        self._retile()
+        self._apply_filter()
+        self.loader = ThumbLoader(self.gen, bs.clone(), bs.indices, self)
+        self.loader.ready.connect(self._thumb_ready)
+        self.loader.start()
+        self._refresh()
+
+    @Slot(int, int, object, str)
+    def _thumb_ready(self, gen, i, img, err):
+        if gen != self.gen:
+            return
+        self._done += 1
+        if i not in self._fresh and i in self.items:
+            if img is None:
+                self.items[i].setIcon(placeholder_tile(self.tile.value(), '?'))
+                self.items[i].setToolTip('Bitmap #%d cannot be shown: %s' % (i, err))
+            else:
+                self.thumbs[i] = img
+                self._icon(i)
+        if self._done >= len(self.bset.indices) or self._done % 8 == 0:
+            self._refresh()
+
+    # ---- grid items ----
+    def _label(self, i):
+        d = self.bset.info(i)
+        it = self.items[i]
+        mod = i in self.bset.snaps
+        it.setText('#%d%s\n%s' % (i, ' \u25cf' if mod else '', ('%d\u00d7%d' % d['auto_size']) if d['ok'] else 'unsupported'))
+        f = it.font()
+        f.setBold(mod)
+        it.setFont(f)
+        tip = describe_tip(d)
+        if mod:
+            tip += '\nReplaced (unsaved)' if self.dirty else '\nReplaced'
+        it.setToolTip(tip)
+
+    def _icon(self, i):
+        img = self.thumbs.get(i)
+        if img is not None:
+            self.items[i].setIcon(make_tile(img, self.tile.value(), i in self.bset.snaps))
+
+    def _retile(self):
+        s = self.tile.value()
+        self.win.settings.set('bitmap_tile', s)
+        self.grid.setIconSize(QSize(s, s))
+        self.grid.setGridSize(QSize(s + 16, s + 50))
+        for i in self.items:
+            if i in self.thumbs:
+                self._icon(i)
+
+    def _apply_filter(self, *_):
+        q = self.filter.text().strip().lower().replace('x', '\u00d7')
+        for i, it in self.items.items():
+            hay = it.text().lower().replace('\n', ' ') + (' modified replaced' if i in self.bset.snaps else '')
+            it.setHidden(bool(q) and q not in hay)
+
+    def _changed(self, i):
+        """A bitmap was replaced / reverted (from the dialog or the menu): re-render its tile on the GUI thread."""
+        self.rev += 1
+        self._fresh.add(i)
+        try:
+            im = self.bset.image(i)
+            im.thumbnail((THUMB_MAX, THUMB_MAX))
+            self.thumbs[i] = pil_to_qimage(im)
+        except Exception:
+            traceback.print_exc()
+        self._label(i)
+        self._icon(i)
+        self._refresh()
+
+    # ---- actions ----
+    def open_bitmap(self, i, replace_now=False):
+        if not self.bset or i not in self.items:
+            return
+        dlg = BitmapDialog(self, i, replace_now)
+        dlg.changed.connect(self._changed)
+        dlg.exec()
+
+    def export_indices(self, idxs, restore=True, parent=None):
+        """Export one bitmap to a chosen .png, or several into a chosen folder."""
+        idxs = [i for i in idxs if self.bset and self.bset.info(i)['ok']]
+        if not idxs:
+            return
+        parent = parent or self
+        base = os.path.splitext(os.path.basename(self.loaded))[0]
+        last = str(self.win.settings.get('bitmap_export_dir', '')) or self.start_dir()
+        try:
+            if len(idxs) == 1:
+                i = idxs[0]
+                path, _ = QFileDialog.getSaveFileName(parent, 'Export bitmap as PNG', os.path.join(last, '%s_bitmap_%d.png' % (base, i)),
+                                                      'PNG image (*.png)')
+                if not path:
+                    return
+                if not path.lower().endswith('.png'):
+                    path += '.png'
+                w, h = self.bset.export_png(i, path, restore)
+                self.win.log('ok', 'Exported bitmap #%d -> %s (%d x %d)' % (i, path, w, h))
+                self.win.settings.set('bitmap_export_dir', os.path.dirname(path))
+            else:
+                folder = QFileDialog.getExistingDirectory(parent, 'Export %d bitmaps as PNG into folder' % len(idxs), last)
+                if not folder:
+                    return
+                n = 0
+                for i in idxs:
+                    try:
+                        self.bset.export_png(i, os.path.join(folder, '%s_bitmap_%d.png' % (base, i)), restore)
+                        n += 1
+                    except Exception:
+                        traceback.print_exc()
+                self.win.log('ok', 'Exported %d of %d bitmaps into %s' % (n, len(idxs), folder))
+                self.win.settings.set('bitmap_export_dir', folder)
+        except Exception as e:
+            traceback.print_exc()
+            self.win.error('Export failed:\n%s' % e)
+
+    def _menu(self, pos):
+        it = self.grid.itemAt(pos)
+        if not it:
+            return
+        if not it.isSelected():
+            self.grid.clearSelection()
+            it.setSelected(True)
+        idxs = self.selected_indices()
+        one = len(idxs) == 1
+        usable = [i for i in idxs if self.bset.info(i)['ok']]
+        m = QMenu(self)
+        a_open = m.addAction('Open\u2026') if one else None
+        a_exp = m.addAction('Export as PNG\u2026' if len(usable) <= 1 else 'Export %d images as PNG\u2026' % len(usable))
+        a_exp.setEnabled(bool(usable))
+        a_rep = m.addAction('Replace with image\u2026') if one else None
+        if a_rep:
+            a_rep.setEnabled(bool(usable))
+        m.addSeparator()
+        mods = [i for i in idxs if i in self.bset.snaps]
+        a_rev = m.addAction('Revert to original')
+        a_rev.setEnabled(bool(mods))
+        act = m.exec(self.grid.viewport().mapToGlobal(pos))
+        if act is None:
+            return
+        if act is a_open:
+            self.open_bitmap(idxs[0])
+        elif act is a_exp:
+            self.export_indices(usable)
+        elif act is a_rep:
+            self.open_bitmap(idxs[0], replace_now=True)
+        elif act is a_rev:
+            for i in mods:
+                self.bset.revert(i)
+                self._changed(i)
+
+    def revert_all(self):
+        if not self.bset or not self.bset.modified:
+            return
+        for i in list(self.bset.modified):
+            self.bset.revert(i)
+            self._changed(i)
+        self.win.log('gui', 'All bitmaps reverted to the original')
+
+    def save(self):
+        if not self.bset or not self.bset.modified:
+            return
+        src = self.loaded
+        path, _ = QFileDialog.getSaveFileName(self, 'Save PCK as', os.path.splitext(src)[0] + '_edited.pck', 'PCK files (*.pck)')
+        if not path:
+            return
+        if not path.lower().endswith('.pck'):
+            path += '.pck'
+        try:
+            with rpck.replacing(src, path) as (_, bak):       # same file as the loaded pck: the original is kept as <name>.old
+                self.bset.save(path)
+        except Exception as e:
+            traceback.print_exc()
+            return self.win.error('Could not write the pck:\n%s' % e)
+        if bak:
+            self.win.log('gui', 'Original kept as %s' % bak)
+        self.saved_rev = self.rev
+        for i in self.bset.modified:
+            self._label(i)
+        self._refresh()
+        self.win.log('ok', 'Saved %s with %d replaced bitmap(s)' % (path, len(self.bset.modified)))
+
+
+def describe_tip(d):
+    """Tooltip text of a grid item."""
+    if not d['ok']:
+        return 'Bitmap #%d cannot be shown: %s' % (d['index'], d['error'])
+    s = 'Bitmap #%d: %d x %d px, %d-bit palette (%d colours)' % (d['index'], d['auto_size'][0], d['auto_size'][1], d['bpp'], d['ncol'])
+    if d['auto_size'] != (d['tex_w'], d['tex_h']):
+        s += '\nStored as a %d x %d texture' % (d['tex_w'], d['tex_h'])
+    if d['screen_aspect'] and abs(d['screen_aspect'] / d['aspect'] - 1) >= 0.01:
+        s += '\nDrawn at %.3f : 1 (its stored source size is %d x %d)' % (d['screen_aspect'], d['src_w'], d['src_h'])
+    return s
 
 
 class BrowserTab(BaseTab):
@@ -1194,12 +1874,17 @@ class BrowserTab(BaseTab):
         m = QMenu(self)
         a_copy = m.addAction('Copy full path')
         a_prev = m.addAction('Preview')
+        a_bmp = m.addAction('Open in %s tab' % BITMAP_TAB_NAME)
         act = m.exec(self.list.viewport().mapToGlobal(pos))
         if act is a_copy:
             QGuiApplication.clipboard().setText(path)
             self.win.log('gui', 'Copied to clipboard: %s' % path)
         elif act is a_prev:
             self.win.preview_pck(path)
+        elif act is a_bmp:
+            self.win.tab_bitmaps.pck.setText(path)
+            if self.win.tab_bitmaps.loaded == path:                      # not refused by the unsaved-changes prompt
+                self.win.tabs.setCurrentWidget(self.win.tab_bitmaps)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1265,10 +1950,12 @@ class WelcomeDialog(QDialog):
             '<li><b>%s</b>: build a brand-new .pck from a plain SWF, using an original pck as donor.</li>'
             '<li><b>%s</b>: replace the looping background movie of a menu pck (bg_arcade, bg_career, bg_options, \u2026) with your own GIF.</li>'
             '<li><b>%s</b>: change the accent colour and the artwork of a loading screen pck.</li>'
-            '<li><b>PCK Browser</b>: right-click a file to copy its path or preview it.</li>'
+            '<li><b>%s</b>: browse every bitmap of a pck as a grid, export one as PNG or replace it with a new image.</li>'
+            '<li><b>PCK Browser</b>: right-click a file to copy its path, preview it or open it in the bitmap viewer.</li>'
             '</ol>'
             '<p>Everything the library does is logged in the console at the bottom of the window.</p>'
-            % (html.escape(APP_NAME), html.escape(PORT_TAB_NAME), html.escape(ANIM_TAB_NAME), html.escape(LOAD_TAB_NAME)))
+            % (html.escape(APP_NAME), html.escape(PORT_TAB_NAME), html.escape(ANIM_TAB_NAME), html.escape(LOAD_TAB_NAME),
+               html.escape(BITMAP_TAB_NAME)))
         lbl.setWordWrap(True)
         lbl.setTextFormat(Qt.RichText)
         b_set, b_close, b_never = QPushButton('Open Settings'), QPushButton('Close'), QPushButton('Never show again')
@@ -1330,12 +2017,14 @@ class MainWindow(QMainWindow):
         self.tab_port = SwfPortTab(self)
         self.tab_anim = AnimTab(self)
         self.tab_load = LoadTab(self)
+        self.tab_bitmaps = BitmapsTab(self)
         self.tab_browser = BrowserTab(self)
         self.tabs.addTab(self.tab_p2s.scrolled(), 'PCK \u2192 SWF')
         self.tabs.addTab(self.tab_s2p.scrolled(), 'SWF \u2192 PCK')
         self.tabs.addTab(self.tab_port.scrolled(), PORT_TAB_NAME)
         self.tabs.addTab(self.tab_anim.scrolled(), ANIM_TAB_NAME)
         self.tabs.addTab(self.tab_load.scrolled(), LOAD_TAB_NAME)
+        self.tabs.addTab(self.tab_bitmaps, BITMAP_TAB_NAME)             # not wrapped in a scroll area: the grid scrolls itself
         self.tabs.addTab(self.tab_browser, 'PCK Browser')
 
         split = QSplitter(Qt.Vertical)
@@ -1477,6 +2166,10 @@ class MainWindow(QMainWindow):
         WelcomeDialog(self, self.settings, self.open_settings).exec()
 
     def closeEvent(self, e):
+        if not self.tab_bitmaps.confirm_discard():
+            e.ignore()
+            return
+        self.tab_bitmaps._stop_loader()
         running = [j for j in self.jobs if j.isRunning()]
         if running:
             r = QMessageBox.question(self, 'Quit', 'A conversion is still running. Quit anyway?')

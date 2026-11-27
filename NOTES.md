@@ -240,3 +240,29 @@ Objects are at the same indices in all three files (120 objects): shape 8 = artw
 * Other things that differ between the screens but are not touched: the title font object 33 (glyph data), shape 11/sprite 41 in generic (an extra placement), the bitmap pointers of the 52 spinner frames (just a layout shift).
 Verified (selftest_load.py, three sample pcks): structure found, own colours written back = identical file, accent recolour, artwork (shared / separate / dither) keeps size, pckaudit clean, corners kept, no seam with the shared palette, pck2swf -> swf2pck identical. NOT verified in the game.
 Note: Pillow ignores `dither` unless a palette is passed; pckanim.quantize_opaque therefore re-maps onto the median-cut palette in a second pass (the first version of the animation tab's 'dither' option did nothing).
+
+## Bitmap viewer / exporter / replacer: pckbitmaps.py (+ the GUI "Bitmaps" tab)
+`python3 pckbitmaps.py X.pck list | export INDEX out.png [--raw] | export-all FOLDER [--raw] | replace INDEX my.png out.pck [--fit cover|contain|stretch] [--dither]`
+Lists every type-4 object: source size (from the object's 1/size floats at +0x10), texture size, 4/8 bpp, colour count, and which bitmaps share one pixel block.
+* True proportions: when the original image was not a power of two the whole image was stretched over the whole texture (see "Texture convention"), so the displayed / exported size is the SOURCE size (legal.pck #20: 425x125 in a 512x128 4bpp texture); `--raw` keeps the texture size.
+  PS2 palette alpha 0..128 (128 = opaque) is mapped to 0..255 on export.
+* Replace is in place and size neutral (rpck.bitmap_encode_into): the new image is fitted to the source aspect (cover = crop, contain = TRANSPARENT bars, stretch), resized to the texture, then reduced to the bitmap's own palette size (16 for type 6, 256 for types 1/5; median cut, optional Floyd-Steinberg; images with transparency use the octree quantiser, which keeps alpha, palette alpha = round(a/2)).
+  The texture size, source-size floats and GS upload block are not touched, so a 4bpp slot stays 16 colours (photos will posterise; use dither). The editor keeps a (pixels, palette) snapshot per bitmap, so reverting is byte-exact.
+* Decoding of the 8bpp swizzle is vectorised with numpy when it is installed (identical output, checked against rpck.unswizzle8); without numpy (the PyInstaller bundle excludes it) the pure Python path is used.
+* Verified (selftest_bitmaps.py, on the pck embedded in examples/legal_pck_fixed.swf): fast decode == reference, true-size export, preview == written result for all three fits (8 and 4 bpp), neighbouring bitmaps untouched, file size unchanged, pckaudit clean, revert byte-identical, export -> re-import round trip. The GUI tab was exercised only against a stubbed Qt (logic, not rendering). NOT verified in the game: whether a replaced bitmap whose slot had no alpha looks right when it now contains transparent palette entries ('contain' with bars).
+* **Reference aspect = the aspect the bitmap is DRAWN with (`--aspect auto`, default), else the stored source size (`--aspect source`).** The source size
+  (+0x10 floats) is not always what the game shows: a 64x64 animation frame is stretched ~9.7 x 6.8 by its placement, half of a stitched artwork covers only
+  half of the picture, etc. `BitmapSet.screen(i)` finds every shape fill that uses the bitmap (flag 0x40/0x41), inverts the fill matrix (px -> UV) to get the
+  unit UV square back in shape space (width vector / height vector), then multiplies both by the linear part of every placement matrix up the sprite chain
+  (new Place/PlaceClip commands only, composed to the stage, <= 8 levels). `screen_aspect` = |width| / |height|. It is trusted when all uses agree within 3%;
+  if the bitmap is used with different proportions, or by no shape, the source aspect is used and the GUI / `list` says why. A shape that is never placed
+  still gives its own (fill matrix) aspect, `screen_basis` says which ('placement' / 'shape' / 'none'). The exported PNG, the thumbnails, the preview and the
+  cover/contain fitting all use this aspect, at the smallest size of that aspect that keeps the texture's detail (`_display_size`), so export -> re-import is
+  lossless in proportions. Not handled: placements that are changed later by a "move" command (char 0xFFFF) or by script `_xscale`/`_yscale`; the fill matrix is
+  assumed to map shape px (twips/20) -> UV like the originals do. On the sample pck all four bitmaps are drawn at their source aspect (the matrix "undoes the
+  stretch"), so the mismatch case is covered by a synthetic test (selftest_bitmaps.py `check_drawn_aspect`: patched placement scale, nested sprite chain,
+  ambiguous uses) - NOT yet checked against the bg_*.pck / loadscreen files, which were not part of this archive.
+* Saving over the source pck is allowed everywhere (bitmaps, animated BG and loading-screen tabs, `pckbitmaps.py replace`, `ops.*_replace/_edit`): `rpck.replacing(src, out)`
+  first renames the original to `<name>.pck.old` (`.old2`, `.old3` ... if that exists, so an earlier backup is never overwritten), reads from it, and puts it back if the write
+  fails. Writing to a different path touches nothing.
+Bitmaps that are only part of a bigger picture (the loading-screen artwork is two 256x256 halves, animation frames are 64x64 each) appear as separate bitmaps; use the dedicated Loading Screen / Animated BG tabs for those.

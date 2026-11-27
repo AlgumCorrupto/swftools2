@@ -3,10 +3,39 @@
 A .pck is a 0x80-byte header followed by a load-in-place dump of C++ objects
 (see NOTES.md).  Pointers are absolute: base_address + offset-in-data.
 """
-import struct
+import struct, os, contextlib
 
 HDR = 0x80
 OBJ_NAMES = {1: 'SHAPE', 2: 'SPRITE', 3: 'BUTTON', 4: 'BITMAP', 5: 'FONT', 6: 'TEXT', 7: 'EDITTEXT'}
+
+
+def backup_name(path):
+    """first free name of path + '.old', '.old2', '.old3' ..."""
+    n, k = path + '.old', 1
+    while os.path.lexists(n):
+        k += 1; n = '%s.old%d' % (path, k)
+    return n
+
+
+@contextlib.contextmanager
+def replacing(src, out):
+    """Context for writing `out` from `src`.  Yields (path to read the source from, backup path or None).
+    When `out` is the same file as `src` the original is first renamed to <out>.old (.old2 ... when that exists, so an earlier
+    backup is never overwritten) and the yielded path points at that backup; the caller then writes `out` as usual.  If the body
+    fails, the partial output is removed and the original is put back under its own name."""
+    if not (src and os.path.exists(src) and os.path.exists(out) and os.path.samefile(src, out)):
+        yield src, None
+        return
+    bak = backup_name(out)
+    os.rename(out, bak)
+    try:
+        yield bak, bak
+    except BaseException:
+        if os.path.exists(out): os.remove(out)
+        os.rename(bak, out)
+        raise
+
+
 # class vtable constants as stored in the (PS2, MC3) files; the loader overwrites them
 VT = {0: 0x211a50, 1: 0x211c00, 2: 0x211c60, 3: 0x211cc0, 4: 0x211c90, 5: 0x211ae0, 6: 0x211ab0, 7: 0x211a80}
 CMD_VT = {0: 0x211d30, 1: 0x211d10, 2: 0x211cf0, 3: 0x211d70}

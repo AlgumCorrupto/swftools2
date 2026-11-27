@@ -129,8 +129,11 @@ def anim_export_gif(pck, sprite, out):
 def anim_replace(pck, out, sprite, src, fit='cover', length='timing', opacity=None, dither=False, fps=None):
     """Replace animation `sprite` of `pck` with the GIF/APNG/WebP or image folder `src` and write `out`.
     length: 'original' | 'timing' | 'frames' | int;  opacity: None (keep) or 0..1."""
-    import pckanim
-    return pckanim.replace(pck, out, sprite, src, fit, length, opacity, bool(dither), fps, log=lambda m: print(m))
+    import pckanim, rpck
+    with rpck.replacing(pck, out) as (rd, bak):          # out == pck: the original is kept as <pck>.old
+        res = pckanim.replace(rd, out, sprite, src, fit, length, opacity, bool(dither), fps, log=lambda m: print(m))
+    if bak: print('original kept as %s' % bak)
+    return res
 
 
 def load_scan(pck):
@@ -158,8 +161,42 @@ def load_export_art(pck, out):
 
 def load_edit(pck, out, bar=None, text=None, tint=None, image=None, fit='cover', keep_mask=True, dither=False, palette='shared', frame=None):
     """Apply colour changes ((r,g,b) or None = keep), a new artwork image and/or a frame overlay (SVG / image path) to a loading-screen pck and write `out`."""
-    import pckload
-    return pckload.edit(pck, out, bar, text, tint, None, image or None, fit, keep_mask, dither, palette, log=lambda m: print(m), frame=frame or None)
+    import pckload, rpck
+    with rpck.replacing(pck, out) as (rd, bak):          # out == pck: the original is kept as <pck>.old
+        res = pckload.edit(rd, out, bar, text, tint, None, image or None, fit, keep_mask, dither, palette, log=lambda m: print(m), frame=frame or None)
+    if bak: print('original kept as %s' % bak)
+    return res
+
+
+def bitmap_list(pck):
+    """Bitmaps of a pck -> list of plain dicts (see pckbitmaps.BitmapSet.info); also printed."""
+    import pckbitmaps
+    bs = pckbitmaps.BitmapSet(pck)
+    res = bs.listing()
+    for d in res:
+        print(pckbitmaps.describe(d))
+    print('%d bitmap(s) in %s' % (len(res), pck))
+    return res
+
+
+def bitmap_export(pck, index, out, restore_size=True, aspect='auto'):
+    """Write bitmap object `index` as PNG (restore_size: at its true proportions, else the raw texture size).
+    aspect: 'auto' = the proportions the game draws it with when known, 'source' = the stored source size. Returns (w, h)."""
+    import pckbitmaps
+    return pckbitmaps.BitmapSet(pck).export_png(int(index), out, restore_size, aspect)
+
+
+def bitmap_replace(pck, out, index, image, fit='cover', dither=False, aspect='auto'):
+    """Replace bitmap object `index` of `pck` with `image` (path) and write `out` (when `out` is `pck` itself, the original is kept as <pck>.old).
+    aspect: the reference the image is fitted to - 'auto' = as the game draws the bitmap (when known), 'source' = stored source size."""
+    import pckbitmaps, rpck
+    bs = pckbitmaps.BitmapSet(pck)
+    bs.replace(int(index), image, fit, bool(dither), aspect)
+    with rpck.replacing(pck, out) as (_, bak):
+        bs.save(out)
+    if bak: print('original kept as %s' % bak)
+    print('wrote %s' % out)
+    return out
 
 
 def preview_swf(pck, tmpdir):
