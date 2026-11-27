@@ -46,6 +46,22 @@ def _poly_fills(p, a):
     return out
 
 
+def _tex_boxes(p, shape, left, right):
+    """[left, right] (xmin, xmax, ymin, ymax) px that each texture (UV 0..1) covers, from the fill matrices (px -> UV); None if rotated/skewed.
+    These are usually a little LARGER than the polygons (the polygon crops the texture by 1-3 px), so they - not the polygon boxes - say
+    where a texture pixel lands on screen."""
+    try: sh = p.read_shape(p.ptrs[shape])
+    except Exception: return None
+    got = {}
+    for f in sh['fills']:
+        if f.get('bitmap') in (left, right) and f['flag'] in (0x40, 0x41):
+            m = f['matrix']
+            if abs(m[1]) > 1e-9 or abs(m[2]) > 1e-9 or not m[0] or not m[3]: return None
+            xs = sorted(((0 - m[4]) / m[0], (1 - m[4]) / m[0])); ys = sorted(((0 - m[5]) / m[3], (1 - m[5]) / m[3]))
+            got[f['bitmap']] = (xs[0], xs[1], ys[0], ys[1])
+    return [got[left], got[right]] if left in got and right in got else None
+
+
 def _root_named(p):
     names = {}
     for h in p.frames_of(p.frames, p.fc):
@@ -88,6 +104,8 @@ def find_loadscreen(p):
                          boxes=(L[1], R[1]), origin=(x0, y0),                                  # polygon boxes (xmin, xmax, ymin, ymax) px, left / right half
                          top='right' if pf.index(R) > pf.index(L) else 'left',                  # the half that is drawn last (on top where they overlap)
                          overlap=L[1][1] - R[1][0])                                             # px the halves overlap (negative = gap)
+        tb = _tex_boxes(p, i, L[0], R[0])
+        if tb: ls['art']['tboxes'] = tb                                                         # px box the fill matrix stretches each TEXTURE over (the polygon only crops it)
     # loader bar: the only shape with two solid fills, the second grey 179
     for i in range(1, p.count):
         a = p.ptrs[i]
@@ -217,38 +235,65 @@ def decode_textures(p, ls):
     return out
 
 
-def half_boxes(a):
-    """canvas-space (float) boxes (x0, y0, x1, y1) that the left / right texture covers.  The canvas is the artwork's screen rectangle stretched
-    to `size` (512x256); each texture is stretched over its own polygon, so the boxes overlap (or leave a gap) exactly as the polygons do."""
+def _to_canvas(a, boxes):
     W, H = a['size']; ox, oy = a['origin']; sw, sh = a['screen']
     if sw <= 0 or sh <= 0: return [(0.0, 0.0, W / 2.0, float(H)), (W / 2.0, 0.0, float(W), float(H))]
-    return [((bx0 - ox) / sw * W, (by0 - oy) / sh * H, (bx1 - ox) / sw * W, (by1 - oy) / sh * H) for bx0, bx1, by0, by1 in a['boxes']]
+    return [((bx0 - ox) / sw * W, (by0 - oy) / sh * H, (bx1 - ox) / sw * W, (by1 - oy) / sh * H) for bx0, bx1, by0, by1 in boxes]
+
+
+def half_boxes(a):
+    """canvas-space (float) boxes (x0, y0, x1, y1) that the left / right TEXTURE is stretched over (from the fill matrices; the polygon boxes when those
+    are not known).  The canvas is the artwork's visible rectangle (union of the polygons) stretched to `size` (512x256).  The boxes can reach a little
+    outside the canvas and overlap each other by more than the polygons do."""
+    return _to_canvas(a, a.get('tboxes') or a['boxes'])
+
+
+def clip_boxes(a):
+    """canvas-space boxes of the two POLYGONS: the part of each texture that is actually drawn"""
+    return _to_canvas(a, a['boxes'])
+
+
+def _pad(img, m, fill_alpha=None):
+    """img with an m px border that repeats the edge pixels (textures may reach slightly outside the canvas)"""
+    from PIL import Image
+    W, H = img.size; out = Image.new(img.mode, (W + 2 * m, H + 2 * m)); out.paste(img, (m, m))
+    out.paste(img.crop((0, 0, 1, H)).resize((m, H)), (0, m)); out.paste(img.crop((W - 1, 0, W, H)).resize((m, H)), (W + m, m))
+    out.paste(img.crop((0, 0, W, 1)).resize((W, m)), (m, 0)); out.paste(img.crop((0, H - 1, W, H)).resize((W, m)), (m, H + m))
+    for cx, cy, px, py in ((0, 0, 0, 0), (W - 1, 0, W + m, 0), (0, H - 1, 0, H + m), (W - 1, H - 1, W + m, H + m)):
+        out.paste(img.crop((cx, cy, cx + 1, cy + 1)).resize((m, m)), (px, py))
+    return out
 
 
 def halves_to_textures(img, boxes, tex, resample=None):
-    """canvas image (W x H) -> the two textures side by side (2*tw x th): each half samples the canvas box its polygon covers"""
+    """canvas image (W x H) -> the two textures side by side (2*tw x th): each half samples the canvas box its fill stretches it over
+    (outside the canvas the edge pixels are repeated)"""
     from PIL import Image
     tw, th = tex; out = Image.new(img.mode, (tw * 2, th)); resample = resample or Image.LANCZOS
+    M = 16; padded = None
     for k, (c0, r0, c1, r1) in enumerate(boxes):
         if c1 - c0 < 1e-6 or r1 - r0 < 1e-6: continue
-        if all(abs(v - round(v)) < 1e-6 for v in (c0, r0, c1, r1)) and (round(c1 - c0), round(r1 - r0)) == (tw, th):
-            t = img.crop(tuple(int(round(v)) for v in (c0, r0, c1, r1)))              # 1:1: no resampling at all
+        if all(abs(v - round(v)) < 1e-6 for v in (c0, r0, c1, r1)) and (round(c1 - c0), round(r1 - r0)) == (tw, th) and c0 >= 0 and r0 >= 0 and c1 <= img.width and r1 <= img.height:
+            t = img.crop(tuple(int(round(v)) for v in (c0, r0, c1, r1)))              # 1:1 inside the canvas: no resampling at all
         else:
-            t = img.resize((tw, th), resample, box=(max(0.0, c0), max(0.0, r0), min(float(img.width), c1), min(float(img.height), r1)))
+            if padded is None: padded = _pad(img, M)
+            t = padded.resize((tw, th), resample, box=(max(0.0, c0 + M), max(0.0, r0 + M), min(float(padded.width), c1 + M), min(float(padded.height), r1 + M)))
         out.paste(t, (k * tw, 0))
     return out
 
 
-def compose_halves(tiles, boxes, size, top='right'):
-    """the two textures -> the picture the game draws (canvas W x H): every texture stretched over its box, the `top` half drawn last"""
+def compose_halves(tiles, boxes, size, top='right', clip=None):
+    """the two textures -> the picture the game draws (canvas W x H): every texture stretched over its box and cropped to its polygon (`clip`),
+    the `top` half drawn last"""
     from PIL import Image
     out = Image.new('RGBA', size, (0, 0, 0, 0))
     for k in ((0, 1) if top == 'right' else (1, 0)):
         x0, y0, x1, y1 = [int(round(v)) for v in boxes[k]]
-        x0, y0, x1, y1 = max(0, x0), max(0, y0), min(size[0], x1), min(size[1], y1)
         if x1 <= x0 or y1 <= y0: continue
         t = tiles[k] if tiles[k].size == (x1 - x0, y1 - y0) else tiles[k].resize((x1 - x0, y1 - y0), Image.LANCZOS)
-        out.alpha_composite(t, (x0, y0))
+        layer = Image.new('RGBA', size, (0, 0, 0, 0)); layer.paste(t, (x0, y0))
+        cx0, cy0, cx1, cy1 = [int(round(v)) for v in (clip[k] if clip else boxes[k])]
+        layer = layer.crop((max(0, cx0), max(0, cy0), min(size[0], cx1), min(size[1], cy1)))
+        if layer.width > 0 and layer.height > 0: out.alpha_composite(layer, (max(0, cx0), max(0, cy0)))
     return out
 
 
@@ -256,7 +301,7 @@ def decode_art(p, ls):
     """-> RGBA image of the artwork as the game draws it (the polygons' screen layout at 512x256; see half_boxes).  With polygons that tile exactly
     this is the two textures side by side."""
     a = ls['art']
-    return compose_halves(_tiles(p, ls), half_boxes(a), a['size'], a.get('top', 'right'))
+    return compose_halves(_tiles(p, ls), half_boxes(a), a['size'], a.get('top', 'right'), clip_boxes(a))
 
 
 def display_preview(img, aspect, width=None):
