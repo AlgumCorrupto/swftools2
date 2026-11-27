@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 512 256">
+  <defs>
+    <style>
+      .cls-1{fill:none;stroke:#757375;stroke-width:2;stroke-miterlimit:10}
+      .cls-2{fill:none;stroke:#707070;stroke-width:3;stroke-miterlimit:10}
+    </style>
+  </defs>
+  <title>Artboard 1</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <g id="thing" data-vc-layer="sublayer">
+      <path d="M5.234 0.112 L5.006 212.56 C2.776 234.175 20.667 251.446 45.15 252.11 L512.209 252.155" class="cls-1"/>
+      <path d="M73.474 195.206" class="cls-2"/>
+    </g>
+  </g>
+</svg>

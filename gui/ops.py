@@ -143,10 +143,10 @@ def load_scan(pck):
                 art=None if not a else dict(size=a['size'], tex=a['tex'], screen=a['screen'], aspect=a['aspect'], unsupported=a['unsupported']))
 
 
-def load_preview(pck, out_png, image=None, fit='cover', keep_mask=True, dither=False, palette='shared'):
+def load_preview(pck, out_png, image=None, fit='cover', keep_mask=True, dither=False, palette='shared', frame=None):
     """Write a PNG preview of the artwork (current, or as it would look with `image`); returns the path."""
     import pckload
-    pckload.preview(pck, image or None, fit, keep_mask, dither, palette).save(out_png)
+    pckload.preview(pck, image or None, fit, keep_mask, dither, palette, frame=frame or None).save(out_png)
     return out_png
 
 
@@ -156,10 +156,10 @@ def load_export_art(pck, out):
     return pckload.export_art(pck, out)
 
 
-def load_edit(pck, out, bar=None, text=None, tint=None, image=None, fit='cover', keep_mask=True, dither=False, palette='shared'):
-    """Apply colour changes ((r,g,b) or None = keep) and/or a new artwork image to a loading-screen pck and write `out`."""
+def load_edit(pck, out, bar=None, text=None, tint=None, image=None, fit='cover', keep_mask=True, dither=False, palette='shared', frame=None):
+    """Apply colour changes ((r,g,b) or None = keep), a new artwork image and/or a frame overlay (SVG / image path) to a loading-screen pck and write `out`."""
     import pckload
-    return pckload.edit(pck, out, bar, text, tint, None, image or None, fit, keep_mask, dither, palette, log=lambda m: print(m))
+    return pckload.edit(pck, out, bar, text, tint, None, image or None, fit, keep_mask, dither, palette, log=lambda m: print(m), frame=frame or None)
 
 
 def preview_swf(pck, tmpdir):

@@ -15,6 +15,7 @@ os.environ.setdefault('QT_API', 'pyside6')      # for qt-themes / qtpy
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ops                                      # noqa: E402  (also puts the tools folder on sys.path)
+from pckload import DEFAULT_FRAME                # noqa: E402  (bundled assets/frame.svg)
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot, QSettings, QTimer   # noqa: E402
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QMovie, QPalette, QPixmap               # noqa: E402
@@ -942,14 +943,20 @@ class LoadTab(BaseTab):
         self.pal = QComboBox()
         self.pal.addItem('Shared palette (no seam between the halves)', 'shared')
         self.pal.addItem('Separate palettes (more colours, may show a seam)', 'separate')
-        self.mask = QCheckBox('Keep the original rounded corners')
-        self.mask.setChecked(True)
         self.dither = QCheckBox('Dither colours (smoother gradients, adds grain)')
         f.addRow('New artwork', self.img)
         f.addRow('Fit', self.fit)
         f.addRow('Palette', self.pal)
-        f.addRow(self.mask)
         f.addRow(self.dither)
+        self.use_frame = QCheckBox('Draw a frame over the artwork')
+        self.use_frame.setToolTip('Draws the frame (a thin line along the left and bottom edge by default) over the artwork and cuts the artwork along it, so the '
+                                  'rounded corner follows the frame (smooth edge). Without a frame the original rounded corners are kept. Without a new '
+                                  'image it is drawn over the current artwork, which is then re-encoded (256 colours per texture, as before).')
+        self.frame = PathRow('open', None, 'Frame (*.svg *.png *.webp);;All files (*)', 'Frame SVG / PNG with transparency', self.start_dir)
+        self.frame.setText(DEFAULT_FRAME)
+        self.frame.setEnabled(False)
+        f.addRow(self.use_frame)
+        f.addRow('Frame file', self.frame)
         row = QHBoxLayout()
         self.btn_exp = QPushButton('Export current artwork as PNG\u2026')
         row.addWidget(self.btn_exp)
@@ -975,8 +982,10 @@ class LoadTab(BaseTab):
         lay.addStretch()
 
         self.pck.changed.connect(self._pck_changed)
-        for w in (self.img.changed, self.fit.currentIndexChanged, self.pal.currentIndexChanged, self.mask.toggled, self.dither.toggled):
+        for w in (self.img.changed, self.fit.currentIndexChanged, self.pal.currentIndexChanged, self.dither.toggled,\
+                  self.use_frame.toggled, self.frame.changed):
             w.connect(self._update_preview)
+        self.use_frame.toggled.connect(self.frame.setEnabled)
         self.btn_all.clicked.connect(self.set_all)
         self.btn_reset.clicked.connect(self.reset_colors)
         self.btn_exp.clicked.connect(self.export_art)
@@ -989,7 +998,9 @@ class LoadTab(BaseTab):
         self.btn_all.setEnabled(ok and any(self.orig.get(k) for k in ('bar', 'text', 'tint')))
         self.btn_reset.setEnabled(ok)
         self.btn_exp.setEnabled(ok and bool(self.info.get('art')))
-        self.img.setEnabled(ok and bool(self.info.get('art')) and not self.info['art']['unsupported'])
+        art_ok = ok and bool(self.info.get('art')) and not self.info['art']['unsupported']
+        self.img.setEnabled(art_ok)
+        self.use_frame.setEnabled(art_ok)
         self.btn_flash.setEnabled(os.path.isfile(self.dst.text()))
 
     # ---- loading --------------------------------------------------------------------------------------------------
@@ -1053,8 +1064,8 @@ class LoadTab(BaseTab):
         token = self._prev_token
         out = os.path.join(self.win.preview_dir, 'loadart_%d.png' % token)
         img = self.img.text() if os.path.isfile(self.img.text()) else None
-        kw = dict(image=img, fit=self.fit.currentData(), keep_mask=self.mask.isChecked(), dither=self.dither.isChecked(),
-                  palette=self.pal.currentData())
+        kw = dict(image=img, fit=self.fit.currentData(), keep_mask=True, dither=self.dither.isChecked(),
+                  palette=self.pal.currentData(), frame=self._frame_path())
 
         def done(ok, res):
             if token != self._prev_token:
@@ -1064,6 +1075,11 @@ class LoadTab(BaseTab):
             else:
                 self.preview.setText('(preview failed - see the log)')
         self.win.run_job(lambda: ops.load_preview(t, out, **kw), done)
+
+    def _frame_path(self):
+        """the frame file to draw, or None when the option is off / the file is missing"""
+        p = self.frame.text()
+        return p if self.use_frame.isChecked() and os.path.isfile(p) else None
 
     def export_art(self):
         t = self.pck.text()
@@ -1089,10 +1105,13 @@ class LoadTab(BaseTab):
         changed = {}
         for key, btn in (('bar', self.c_bar), ('text', self.c_text), ('tint', self.c_tint)):
             changed[key] = btn.rgb if btn.rgb and btn.rgb != self.orig.get(key) else None
-        if not img and not any(changed.values()):
-            return self.win.error('Nothing to change: pick different colours and/or an artwork image.')
-        kw = dict(image=img or None, fit=self.fit.currentData(), keep_mask=self.mask.isChecked(), dither=self.dither.isChecked(),
-                  palette=self.pal.currentData(), **changed)
+        if self.use_frame.isChecked() and not self._frame_path():
+            return self.win.error('The frame file does not exist.')
+        frame = self._frame_path()
+        if not img and not frame and not any(changed.values()):
+            return self.win.error('Nothing to change: pick different colours, an artwork image and/or a frame.')
+        kw = dict(image=img or None, fit=self.fit.currentData(), keep_mask=True, dither=self.dither.isChecked(),
+                  palette=self.pal.currentData(), frame=frame, **changed)
         self.win.log('gui', 'Save loading screen: %s' % dst)
         self.win.run_job(lambda: ops.load_edit(src, dst, **kw), self._done, [self.run])
 

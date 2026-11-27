@@ -210,56 +210,114 @@ def display_preview(img, aspect, width=None):
     return img.resize((w, max(1, round(w / aspect))), Image.LANCZOS)
 
 
-def _quantize(rgb, transparent, dither):
-    """RGB image + list of 'transparent' booleans -> (indices, 256 palette entries); transparent pixels get a reserved alpha-0 entry (index 255)"""
+PARTIAL_LEVELS = 8      # palette entries reserved for anti-aliased (partly transparent) edge pixels
+
+
+def _quantize(rgb, alpha, dither):
+    """RGB image + per-pixel alpha bytes (0 = transparent, 255 = opaque, in between = anti-aliased edge) -> (indices, 256 palette entries).
+    Transparent pixels get a reserved alpha-0 entry (index 255); edge pixels get one of PARTIAL_LEVELS reserved entries that share the edge colour
+    and differ in alpha (the palette stores alpha per entry, 0..128 = opaque), so rounded edges are smooth instead of stair-stepped."""
     from PIL import Image
-    any_t = any(transparent)
-    if any_t:                                   # keep the transparent corner out of the palette statistics
-        px = rgb.tobytes(); opaque = [px[3 * i:3 * i + 3] for i in range(len(transparent)) if not transparent[i]][::37]
+    n = len(alpha); px = rgb.tobytes()
+    part = [i for i in range(n) if 0 < alpha[i] < 255]; any_t = any(v == 0 for v in alpha); any_p = bool(part)
+    if any_t or any_p:                          # keep transparent / edge pixels out of the palette statistics
+        opaque = [px[3 * i:3 * i + 3] for i in range(n) if alpha[i] == 255][::37]
         mean = tuple(int(sum(c[k] for c in opaque) / max(1, len(opaque))) for k in range(3)) if opaque else (0, 0, 0)
         fl = bytearray(px)
-        for i, t in enumerate(transparent):
-            if t: fl[3 * i:3 * i + 3] = bytes(mean)
+        for i in range(n):
+            if alpha[i] != 255: fl[3 * i:3 * i + 3] = bytes(mean)
         rgb = Image.frombytes('RGB', rgb.size, bytes(fl))
-    ncol = 255 if any_t else 256
+    edge = (0, 0, 0)
+    if any_p:                                   # one colour for all edge entries: the mean colour of the edge pixels
+        edge = tuple(int(round(sum(px[3 * i + k] for i in part) / len(part))) for k in range(3))
+    ncol = 256 - (1 if any_t else 0) - (PARTIAL_LEVELS if any_p else 0)
     idx, rgbs = pckanim.quantize_opaque(rgb, ncol, dither); idx = bytearray(idx)
-    cols = [(r, g, b, 128) for r, g, b in rgbs]
-    if any_t:
-        cols.append((0, 0, 0, 0))
-        for i, t in enumerate(transparent):
-            if t: idx[i] = 255
-    while len(cols) < 256: cols.append((0, 0, 0, 128))
+    cols = [(r, g, bl, 128) for r, g, bl in rgbs]
+    while len(cols) < ncol: cols.append((0, 0, 0, 128))
+    if any_p:
+        cols += [edge + (max(1, round(128.0 * k / (PARTIAL_LEVELS + 1))),) for k in range(1, PARTIAL_LEVELS + 1)]
+    if any_t: cols.append((0, 0, 0, 0))
+    for i in range(n):
+        if alpha[i] == 0: idx[i] = 255
+        elif alpha[i] < 255: idx[i] = ncol + max(1, min(PARTIAL_LEVELS, round(alpha[i] * (PARTIAL_LEVELS + 1) / 255.0))) - 1
     return bytes(idx), cols
 
 
-def replace_art(p, ls, image, fit='cover', keep_mask=True, dither=False, palette='shared', log=print):
+# ----------------------------------------------------------------------------------------------------------------------
+# frame overlay
+# ----------------------------------------------------------------------------------------------------------------------
+DEFAULT_FRAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'frame.svg')
+
+
+def load_frame(src, size):
+    """frame overlay (SVG, or any raster image with transparency) -> RGBA `size`.  SVG is rendered with cairosvg (pip install cairosvg);
+    the whole image / viewBox is stretched to `size` (the artwork is 512x256, like the bundled assets/frame.svg)."""
+    from PIL import Image
+    if not isinstance(src, (str, bytes, os.PathLike)): return src.convert('RGBA').resize(size, Image.LANCZOS)
+    if str(src).lower().endswith(('.svg', '.svgz')):
+        try:
+            import cairosvg, io
+        except (ImportError, OSError) as e:
+            raise RuntimeError('rendering an SVG frame needs cairosvg (pip install cairosvg, plus the cairo library); or use a PNG frame with transparency (%s)' % e)
+        return Image.open(io.BytesIO(cairosvg.svg2png(url=str(src), output_width=size[0], output_height=size[1]))).convert('RGBA')
+    with Image.open(src) as im: return im.convert('RGBA').resize(size, Image.LANCZOS)
+
+
+def frame_shape(fr):
+    """RGBA frame -> (alpha 'L', paint 'L').  alpha = per-pixel opacity of the artwork: 255 inside the frame line (including the inner edge of the
+    line), the line's own anti-aliasing at its outer edge (so the rounded edge is smooth), 0 outside.  paint = the line pixels that must be drawn
+    in the frame colour instead of blended with the artwork.  The inside is found by flood filling from the centre of the image, so the frame must
+    run edge to edge and enclose the picture (the bundled one does: top edge, down the left, round the corner, along the bottom to the right edge)."""
+    from PIL import ImageDraw, ImageChops, ImageFilter
+    W, H = fr.size; al = fr.getchannel('A')
+    weak = al.point(lambda v: 255 if v >= 32 else 0)                      # seals the picture area
+    if weak.getpixel((W // 2, H // 2)): raise ValueError('the frame covers the centre of the artwork, so its inside cannot be found')
+    fill = weak.copy(); ImageDraw.floodfill(fill, (W // 2, H // 2), 128)
+    inside = fill.point(lambda v: 255 if v == 128 else 0)
+    near = inside.filter(ImageFilter.MaxFilter(3))                        # inside + the line pixels touching it (inner edge)
+    opaque_part = ImageChops.lighter(near, inside)
+    outer = ImageChops.subtract(al, opaque_part)                          # line pixels away from the inside: keep their own alpha
+    alpha = ImageChops.lighter(opaque_part.point(lambda v: 255 if v else 0), outer)
+    paint = ImageChops.subtract(weak, opaque_part)
+    return alpha, paint
+
+
+def replace_art(p, ls, image, fit='cover', keep_mask=True, dither=False, palette='shared', log=print, frame=None):
     """Replace the artwork by `image` (PIL image).  fit: 'cover' crops to the on-screen aspect, 'stretch', 'contain' (black bars).
-    keep_mask: keep the original transparent (rounded) corners.  palette: 'shared' = both textures use one palette (no colour step at the seam;
-    default) or 'separate' = 256 colours each (more accurate colours, the seam can show a faint step).  Returns the stitched RGBA that was written (before palette reduction)."""
+    frame: optional SVG / image path (see load_frame) drawn over the fitted artwork; the artwork is then cut along the frame line (anti-aliased) and
+    the original corners are not used.  Without a frame, keep_mask keeps the original transparent (rounded) corners.  palette: 'shared' = both
+    textures use one palette (no colour step at the seam; default) or 'separate' = 256 colours each (more accurate colours, the seam can show a
+    faint step).  Returns the stitched RGBA that was written (before palette reduction)."""
     from PIL import Image
     a = ls['art']
     if not a: raise ValueError('no artwork found in this pck')
     if a['unsupported']: raise ValueError('artwork cannot be replaced: %s' % a['unsupported'])
     W, H = a['size']; tw, th = a['tex']
     fitted = pckanim.fit_image(image, (W, H), a['aspect'], fit)
-    if keep_mask:
+    if frame:
+        fr = load_frame(frame, (W, H)); fitted.alpha_composite(fr)
+        mask, paint = frame_shape(fr)
+        solid = fr.copy(); solid.putalpha(255)                            # the outer part of the line is drawn in the frame colour, not blended with the artwork
+        fitted.paste(solid, (0, 0), paint)
+    elif keep_mask:
         mask = decode_art(p, ls).getchannel('A').point(lambda v: 255 if v >= 64 else 0)
     else:
         mask = fitted.getchannel('A').point(lambda v: 255 if v >= 128 else 0)
     bg = Image.new('RGBA', (W, H), (0, 0, 0, 255)); bg.alpha_composite(fitted)
     rgb = bg.convert('RGB')
     if palette == 'shared':
-        idx, pal = _quantize(rgb, [v == 0 for v in mask.tobytes()], dither)
+        idx, pal = _quantize(rgb, mask.tobytes(), dither)
         for k, b in enumerate((a['left'], a['right'])):
             bitmap_encode_into(p, b, b''.join(idx[r * W + k * tw:r * W + (k + 1) * tw] for r in range(H)), pal)
     elif palette == 'separate':
         for k, b in enumerate((a['left'], a['right'])):
             box = (k * tw, 0, (k + 1) * tw, th)
-            idx, pal = _quantize(rgb.crop(box), [v == 0 for v in mask.crop(box).tobytes()], dither)
+            idx, pal = _quantize(rgb.crop(box), mask.crop(box).tobytes(), dither)
             bitmap_encode_into(p, b, idx, pal)
     else:
         raise ValueError("palette must be 'shared' or 'separate'")
-    log('artwork replaced (%dx%d, two %dx%d textures, %s fit, %s palette%s%s)' % (W, H, tw, th, fit, palette, ', dithered' if dither else '', ', original corner mask kept' if keep_mask else ''))
+    log('artwork replaced (%dx%d, two %dx%d textures, %s fit, %s palette%s%s)' % (W, H, tw, th, fit, palette, ', dithered' if dither else '',
+        ', cut along the frame' if frame else (', original corner mask kept' if keep_mask else '')))
     out = rgb.convert('RGBA'); out.putalpha(mask)
     return out
 
@@ -267,16 +325,26 @@ def replace_art(p, ls, image, fit='cover', keep_mask=True, dither=False, palette
 # ----------------------------------------------------------------------------------------------------------------------
 # entry points
 # ----------------------------------------------------------------------------------------------------------------------
-def preview(pck, image=None, fit='cover', keep_mask=True, dither=False, palette='shared', width=460):
+def _art_source(p, ls, image, frame):
+    """PIL image to feed replace_art: the given image, or (frame only) the current artwork so the frame is drawn over it."""
+    from PIL import Image
+    if image is not None:
+        if isinstance(image, (str, bytes, os.PathLike)):
+            with Image.open(image) as im: return im.convert('RGBA'), None
+        return image, None
+    if frame: return decode_art(p, ls), 'stretch'
+    return None, None
+
+
+def preview(pck, image=None, fit='cover', keep_mask=True, dither=False, palette='shared', width=460, frame=None):
     """RGBA preview of the artwork exactly as it would be stored (palette-reduced) and shown (squeezed to the game's aspect), on a dark background.
-    image: path / PIL image / None for the current artwork.  Nothing is written."""
+    image: path / PIL image / None for the current artwork.  frame: optional frame overlay (drawn over the current artwork when no image is given).  Nothing is written."""
     from PIL import Image
     p = Pck(pck); ls = find_loadscreen(p)
     if not ls['art']: raise ValueError('no artwork found in this pck')
+    image, f = _art_source(p, ls, image, frame)
     if image is not None:
-        if isinstance(image, (str, bytes, os.PathLike)):
-            with Image.open(image) as im: image = im.convert('RGBA')
-        replace_art(p, ls, image, fit, keep_mask, dither, palette, log=lambda m: None)
+        replace_art(p, ls, image, f or fit, keep_mask, dither, palette, log=lambda m: None, frame=frame)
     art = display_preview(decode_art(p, ls), ls['art']['aspect'], width)
     bg = Image.new('RGBA', art.size, (24, 24, 28, 255)); bg.alpha_composite(art)
     return bg
@@ -306,8 +374,8 @@ def summary(p, ls, cols=None):
     return s + '\nbar %s, text %s, strip tint %s' % (hx(cols['bar']), hx(cols['text']), hx(cols['tint']))
 
 
-def edit(pck, out, bar=None, text=None, tint=None, accent=None, image=None, fit='cover', keep_mask=True, dither=False, palette='shared', log=print):
-    """read `pck`, apply colour and/or artwork changes, write `out`.  accent=(r,g,b) sets bar+text+tint from one colour (explicit bar/text/tint win)."""
+def edit(pck, out, bar=None, text=None, tint=None, accent=None, image=None, fit='cover', keep_mask=True, dither=False, palette='shared', log=print, frame=None):
+    """read `pck`, apply colour and/or artwork changes, write `out`.  accent=(r,g,b) sets bar+text+tint from one colour (explicit bar/text/tint win).  frame: optional frame overlay (SVG/image) drawn over the artwork (over the current one if no image is given)."""
     p = Pck(pck); ls = find_loadscreen(p); size0 = len(p.d) + 0x80
     log(summary(p, ls))
     if accent is not None:
@@ -316,9 +384,8 @@ def edit(pck, out, bar=None, text=None, tint=None, accent=None, image=None, fit=
     else:
         bar = parse_color(bar) if bar else None; text = parse_color(text) if text else None; tint = parse_color(tint) if tint else None
     if bar is not None or text is not None or tint is not None: set_colors(p, ls, bar, text, tint, log)
-    if image is not None:
-        from PIL import Image
-        with Image.open(image) as im: replace_art(p, ls, im.convert('RGBA'), fit, keep_mask, dither, palette, log)
+    src, f = _art_source(p, ls, image, frame)
+    if src is not None: replace_art(p, ls, src, f or fit, keep_mask, dither, palette, log, frame=frame)
     while len(p.d) % 16: p.d.append(0xCD)
     data = p.tobytes()
     with open(out, 'wb') as f: f.write(data)
@@ -342,12 +409,12 @@ def main():
     r.add_argument('--accent', help='#RRGGBB: sets bar, text and strip tint (generic-style derivation)')
     r.add_argument('--bar'); r.add_argument('--text'); r.add_argument('--tint', help='the colour white should become in the strip pattern')
     r.add_argument('--image', help='new artwork (any image)'); r.add_argument('--fit', choices=['cover', 'contain', 'stretch'], default='cover')
-    r.add_argument('--no-mask', action='store_true', help='do not keep the original rounded corners'); r.add_argument('--dither', action='store_true'); r.add_argument('--palette', choices=['shared', 'separate'], default='shared', help='shared (default): no seam; separate: 256 colours per texture')
+    r.add_argument('--no-mask', action='store_true', help='do not keep the original rounded corners'); r.add_argument('--dither', action='store_true'); r.add_argument('--frame', nargs='?', const=DEFAULT_FRAME, help='draw a frame (SVG / PNG with transparency) over the artwork and cut the artwork along it (replaces the original corners); without a value the bundled assets/frame.svg'); r.add_argument('--palette', choices=['shared', 'separate'], default='shared', help='shared (default): no seam; separate: 256 colours per texture')
     a = ap.parse_args()
     if a.cmd == 'info':
         p = Pck(a.pck); print(summary(p, find_loadscreen(p)))
     elif a.cmd == 'export': export_art(a.pck, a.out)
-    else: edit(a.pck, a.out, a.bar, a.text, a.tint, a.accent, a.image, a.fit, not a.no_mask, a.dither, a.palette)
+    else: edit(a.pck, a.out, a.bar, a.text, a.tint, a.accent, a.image, a.fit, not a.no_mask, a.dither, a.palette, frame=a.frame)
 
 
 if __name__ == '__main__':

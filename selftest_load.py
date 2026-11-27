@@ -44,6 +44,12 @@ def main():
             ok = (r['delta'] == 0 and not errs and (np.asarray(im)[:, :, 3] < 64).tolist() == mask0.tolist() and rt == open(out, 'rb').read() and not changed
                   and (pal != 'shared' or dith or seam < max(4.0, 3 * nb)))
             check('art %s palette%s' % (pal, ' + dither' if dith else ''), ok, 'size %+d, audit %d, seam %.1f (neighbour %.1f)' % (r['delta'], len(errs), seam, nb))
+        for img in (art, None):          # frame over a new artwork, and over the current artwork
+            out = os.path.join(tmp, 'frame_%s.pck' % ('new' if img else 'cur')); r = L.edit(src, out, image=img, frame=L.DEFAULT_FRAME, log=quiet)
+            p = Pck(out); ls = L.find_loadscreen(p); im = np.asarray(L.decode_art(p, ls).convert('RGB'), float); _, errs = pckaudit.audit(out)
+            edge = im[60:180, 5:6].mean(axis=(0, 1)); inner = im[60:180, 40:44].mean(axis=(0, 1))     # the frame's left line is ~#757375 at x ~5
+            check('frame over %s artwork' % ('new' if img else 'current'), r['delta'] == 0 and not errs and abs(edge - 112).max() < 40 and not (abs(inner - 112).max() < 8),
+                  'size %+d, audit %d, edge %s' % (r['delta'], len(errs), edge.round()))
     print('FAILED' if bad else 'all OK'); sys.exit(1 if bad else 0)
 
 
