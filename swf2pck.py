@@ -30,7 +30,7 @@ class Writer:
 
     def cxform(s, cx):
         mult, add = cx
-        return s.p.alloc(bytes([clamp(round(m / 4), 0, 255) for m in mult] + [clamp(a, -128, 127) & 255 for a in add]), 4)
+        return s.p.alloc(bytes([clamp(round(m/4), -128, 127) & 255 for m in mult] + [clamp(round(a/4), -128, 127) & 255 for a in add]), 4)
 
     def cmd_list(s, items):
         p = s.p; head = prev = 0

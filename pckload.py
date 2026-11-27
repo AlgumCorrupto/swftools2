@@ -5,6 +5,9 @@ What a loading screen contains (verified on loading_generic_a, loading_network_s
   * ARTWORK  the sprite named 'pict1' holds ONE shape with two polygons side by side; the left polygon is filled with one 256x256
              8bpp bitmap, the right one with another, so the picture is 2 textures stitched into 512x256 (shown at ~450x265 px, aspect
              1.7-1.8, i.e. slightly squeezed).  The rounded corner is baked in as transparent palette entries.
+             Each texture is stretched over ITS OWN polygon, and in some files the polygons overlap by a few px (arcade: up to ~4 px).
+             The picture (export / preview / what replace_art fits an image to) is therefore the polygons' screen layout, not the two
+             textures glued at x=256: cutting a new image at 256 would draw the overlapping strip twice and show a seam.
   * ACCENT   three independent values that the designers picked by hand per screen:
                bar   solid fill 0 of the loader-bar shape (the only shape with two solid fills, the 2nd being grey 179,179,179)
                text  colour of the big translucent EDITTEXT (root sprite whose only content is an EDITTEXT, drawn at ~36 % alpha)
@@ -73,15 +76,18 @@ def find_loadscreen(p):
         L, R = sorted(pf, key=lambda t: t[1][0])
         if abs(L[1][1] - R[1][0]) > 8 or abs(L[1][2] - R[1][2]) > 8 or abs(L[1][3] - R[1][3]) > 8: continue   # the halves may overlap by a few px
         area = (R[1][1] - L[1][0]) * (L[1][3] - L[1][2])
-        if best is None or area > best[0]: best = (area, i, L, R)
+        if best is None or area > best[0]: best = (area, i, L, R, pf)
     if best:
-        _, i, L, R = best; pl, pr = p.bitmap_parts(L[0]), p.bitmap_parts(R[0])
+        _, i, L, R, pf = best; pl, pr = p.bitmap_parts(L[0]), p.bitmap_parts(R[0])
         x0, x1 = L[1][0], R[1][1]; y0, y1 = min(L[1][2], R[1][2]), max(L[1][3], R[1][3])
         un = None
         if (pl['ttype'], pl['ncol'], pl['tw'], pl['th']) != (pr['ttype'], pr['ncol'], pr['tw'], pr['th']) or (pl['ttype'], pl['ncol']) != (1, 256):
             un = 'the two halves are not equal 8bpp/256-colour textures'
         ls['art'] = dict(shape=i, left=L[0], right=R[0], tex=(pl['tw'], pl['th']), size=(pl['tw'] * 2, pl['th']),
-                         screen=(x1 - x0, y1 - y0), aspect=(x1 - x0) / (y1 - y0), unsupported=un)
+                         screen=(x1 - x0, y1 - y0), aspect=(x1 - x0) / (y1 - y0), unsupported=un,
+                         boxes=(L[1], R[1]), origin=(x0, y0),                                  # polygon boxes (xmin, xmax, ymin, ymax) px, left / right half
+                         top='right' if pf.index(R) > pf.index(L) else 'left',                  # the half that is drawn last (on top where they overlap)
+                         overlap=L[1][1] - R[1][0])                                             # px the halves overlap (negative = gap)
     # loader bar: the only shape with two solid fills, the second grey 179
     for i in range(1, p.count):
         a = p.ptrs[i]
@@ -192,15 +198,65 @@ def set_colors(p, ls, bar=None, text=None, tint=None, log=print):
 # ----------------------------------------------------------------------------------------------------------------------
 # artwork
 # ----------------------------------------------------------------------------------------------------------------------
-def decode_art(p, ls):
-    """-> RGBA image of the stitched artwork (left texture | right texture)"""
+def _tiles(p, ls):
+    """[left, right] texture as RGBA"""
     from PIL import Image
-    a = ls['art']; tw, th = a['tex']; out = Image.new('RGBA', a['size'])
-    for k, b in enumerate((a['left'], a['right'])):
+    a = ls['art']; out = []
+    for b in (a['left'], a['right']):
         w, h, idx, pal, tt = bitmap_decode(p, b)
         cols = [(r, g, bl, min(255, al * 2)) for r, g, bl, al in pal]
-        out.paste(Image.frombytes('RGBA', (w, h), b''.join(bytes(cols[i]) for i in idx)), (k * tw, 0))
+        out.append(Image.frombytes('RGBA', (w, h), b''.join(bytes(cols[i]) for i in idx)))
     return out
+
+
+def decode_textures(p, ls):
+    """-> RGBA image of the two textures side by side (left | right), exactly as stored (tw*2 x th)"""
+    from PIL import Image
+    a = ls['art']; tw, th = a['tex']; out = Image.new('RGBA', a['size'])
+    for k, t in enumerate(_tiles(p, ls)): out.paste(t, (k * tw, 0))
+    return out
+
+
+def half_boxes(a):
+    """canvas-space (float) boxes (x0, y0, x1, y1) that the left / right texture covers.  The canvas is the artwork's screen rectangle stretched
+    to `size` (512x256); each texture is stretched over its own polygon, so the boxes overlap (or leave a gap) exactly as the polygons do."""
+    W, H = a['size']; ox, oy = a['origin']; sw, sh = a['screen']
+    if sw <= 0 or sh <= 0: return [(0.0, 0.0, W / 2.0, float(H)), (W / 2.0, 0.0, float(W), float(H))]
+    return [((bx0 - ox) / sw * W, (by0 - oy) / sh * H, (bx1 - ox) / sw * W, (by1 - oy) / sh * H) for bx0, bx1, by0, by1 in a['boxes']]
+
+
+def halves_to_textures(img, boxes, tex, resample=None):
+    """canvas image (W x H) -> the two textures side by side (2*tw x th): each half samples the canvas box its polygon covers"""
+    from PIL import Image
+    tw, th = tex; out = Image.new(img.mode, (tw * 2, th)); resample = resample or Image.LANCZOS
+    for k, (c0, r0, c1, r1) in enumerate(boxes):
+        if c1 - c0 < 1e-6 or r1 - r0 < 1e-6: continue
+        if all(abs(v - round(v)) < 1e-6 for v in (c0, r0, c1, r1)) and (round(c1 - c0), round(r1 - r0)) == (tw, th):
+            t = img.crop(tuple(int(round(v)) for v in (c0, r0, c1, r1)))              # 1:1: no resampling at all
+        else:
+            t = img.resize((tw, th), resample, box=(max(0.0, c0), max(0.0, r0), min(float(img.width), c1), min(float(img.height), r1)))
+        out.paste(t, (k * tw, 0))
+    return out
+
+
+def compose_halves(tiles, boxes, size, top='right'):
+    """the two textures -> the picture the game draws (canvas W x H): every texture stretched over its box, the `top` half drawn last"""
+    from PIL import Image
+    out = Image.new('RGBA', size, (0, 0, 0, 0))
+    for k in ((0, 1) if top == 'right' else (1, 0)):
+        x0, y0, x1, y1 = [int(round(v)) for v in boxes[k]]
+        x0, y0, x1, y1 = max(0, x0), max(0, y0), min(size[0], x1), min(size[1], y1)
+        if x1 <= x0 or y1 <= y0: continue
+        t = tiles[k] if tiles[k].size == (x1 - x0, y1 - y0) else tiles[k].resize((x1 - x0, y1 - y0), Image.LANCZOS)
+        out.alpha_composite(t, (x0, y0))
+    return out
+
+
+def decode_art(p, ls):
+    """-> RGBA image of the artwork as the game draws it (the polygons' screen layout at 512x256; see half_boxes).  With polygons that tile exactly
+    this is the two textures side by side."""
+    a = ls['art']
+    return compose_halves(_tiles(p, ls), half_boxes(a), a['size'], a.get('top', 'right'))
 
 
 def display_preview(img, aspect, width=None):
@@ -305,6 +361,11 @@ def replace_art(p, ls, image, fit='cover', keep_mask=True, dither=False, palette
         mask = fitted.getchannel('A').point(lambda v: 255 if v >= 128 else 0)
     bg = Image.new('RGBA', (W, H), (0, 0, 0, 255)); bg.alpha_composite(fitted)
     rgb = bg.convert('RGB')
+    canvas_rgb, canvas_mask = rgb, mask                                    # what is drawn (the written preview); the textures are cut from it below
+    boxes = half_boxes(a)                                                  # each texture takes the part of the picture ITS polygon covers, so where the
+    rgb = halves_to_textures(rgb, boxes, (tw, th))                         # polygons overlap both hold the same content and there is no seam
+    mask = halves_to_textures(mask, boxes, (tw, th), Image.BILINEAR)
+    if not frame: mask = mask.point(lambda v: 255 if v >= 128 else 0)      # (binary masks stay binary after resampling; a frame keeps its anti-aliased edge)
     if palette == 'shared':
         idx, pal = _quantize(rgb, mask.tobytes(), dither)
         for k, b in enumerate((a['left'], a['right'])):
@@ -318,7 +379,7 @@ def replace_art(p, ls, image, fit='cover', keep_mask=True, dither=False, palette
         raise ValueError("palette must be 'shared' or 'separate'")
     log('artwork replaced (%dx%d, two %dx%d textures, %s fit, %s palette%s%s)' % (W, H, tw, th, fit, palette, ', dithered' if dither else '',
         ', cut along the frame' if frame else (', original corner mask kept' if keep_mask else '')))
-    out = rgb.convert('RGBA'); out.putalpha(mask)
+    out = canvas_rgb.convert('RGBA'); out.putalpha(canvas_mask)
     return out
 
 
@@ -371,6 +432,8 @@ def summary(p, ls, cols=None):
     s = 'artwork: ' + ('not found' if not a else '%dx%d px (two %dx%d textures), shown ~%dx%d px, aspect %.2f%s' % (
         a['size'][0], a['size'][1], a['tex'][0], a['tex'][1], round(a['screen'][0]), round(a['screen'][1]), a['aspect'],
         '  [NOT replaceable: %s]' % a['unsupported'] if a['unsupported'] else ''))
+    if a and abs(a.get('overlap', 0)) >= 0.25:
+        s += '\nthe two halves %s by %.1f px on screen (the artwork is mapped to follow that)' % ('overlap' if a['overlap'] > 0 else 'leave a gap', abs(a['overlap']))
     return s + '\nbar %s, text %s, strip tint %s' % (hx(cols['bar']), hx(cols['text']), hx(cols['tint']))
 
 

@@ -41,7 +41,7 @@ def main():
             seam = np.abs(a[:, 255] - a[:, 256]).mean(); nb = np.abs(a[:, 254] - a[:, 255]).mean()
             conv = pck2swf.Conv(p, True, pck2swf.GlyphSrc(None), None, {}); swf, _ = conv.convert(False, True, open(out, 'rb').read())
             rt, changed, _ = swf2pck.convert(swf, None, log=lambda m: None)
-            ok = (r['delta'] == 0 and not errs and (np.asarray(im)[:, :, 3] < 64).tolist() == mask0.tolist() and rt == open(out, 'rb').read() and not changed
+            ok = (r['delta'] == 0 and not errs and ((np.asarray(im)[:, :, 3] < 64) != mask0).mean() < 0.003 and rt == open(out, 'rb').read() and not changed
                   and (pal != 'shared' or dith or seam < max(4.0, 3 * nb)))
             check('art %s palette%s' % (pal, ' + dither' if dith else ''), ok, 'size %+d, audit %d, seam %.1f (neighbour %.1f)' % (r['delta'], len(errs), seam, nb))
         for img in (art, None):          # frame over a new artwork, and over the current artwork

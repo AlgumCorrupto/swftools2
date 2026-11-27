@@ -220,7 +220,10 @@ class Conv:
         if has_char: body += struct.pack('<H', c['char'])
         if c['matrix']: body += s.pmatrix(c['matrix'])
         if c['cxform']:
-            x = c['cxform']; mult = [v * 4 for v in x[:4]]; add = [v - 256 if v > 127 else v for v in x[4:]]
+            x = c['cxform']; 
+            sg = lambda v: v - 256 if v > 127 else v
+            mult = [sg(v) * 4 for v in x[:4]]
+            add  = [sg(v) * 4 for v in x[4:]]
             body += W.cxform_alpha(mult, add)
         if flags & 0x20: body += c['name'].encode('latin-1') + b'\0'
         if flags & 0x80:
